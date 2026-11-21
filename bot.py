@@ -26,23 +26,7 @@ RECAPTCHA_SITE_KEY = "6Lfxu4UpAAAAAHGbsaANLP86Im_jvVTGp1bjZbN0"
 
 STATES_LIST = ["JHARKHAND", "BIHAR", "DELHI", "MAHARASHTRA", "KARNATAKA", "KERALA"]
 
-PROXIES_CONFIG = [
-    {
-        "server": "http://103.163.55.57:50101",
-        "username": "ZAhaiMvE",
-        "password": "Y39OCfsKR0",
-    },
-    {
-        "server": "http://103.163.55.125:50101",
-        "username": "Me01WF2K",
-        "password": "OHVb4nh60D",
-    },
-    {
-        "server": "http://103.171.77.18:50101",
-        "username": "aRSVpM7F",
-        "password": "VDheTt93j0",
-    },
-]
+PROXIES_CONFIG = []
 
 DEVICE_PROFILES = [
     {
