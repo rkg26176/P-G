@@ -4,12 +4,13 @@ import random
 import time
 from typing import Optional
 from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
-from telegram import Update, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -27,6 +28,25 @@ RECAPTCHA_SITE_KEY = "6Lfxu4UpAAAAAHGbsaANLP86Im_jvVTGp1bjZbN0"
 STATES_LIST = ["JHARKHAND", "BIHAR", "DELHI", "MAHARASHTRA", "KARNATAKA", "KERALA"]
 
 PROXIES_CONFIG = []
+
+CHANNELS = {
+    "-1003332858806": {
+        "name": "📢 GBX LOOT",
+        "url": "https://t.me/+6ByfGDRBKgsxMjZl",
+    },
+    "-1003630519339": {
+        "name": "📢 GBX EARN",
+        "url": "https://t.me/+OWrCoeF-JutmNjg1",
+    },
+    "-1003197501531": {
+        "name": "📢 GBX ZONE",
+        "url": "https://t.me/+f2mWfDs6EUIxYTBl",
+    },
+    "-1003862251237": {
+        "name": "💬 Join Group Chat (GC)",
+        "url": "https://t.me/+O_-kEF2f5f1kMjdl",
+    },
+}
 
 DEVICE_PROFILES = [
     {
@@ -47,7 +67,7 @@ DEVICE_PROFILES = [
     },
 ]
 
-SESSION_TIMEOUT_SECONDS = 600  # 10 मिनट निष्क्रिय रहने पर सेशन ऑटो-क्लोज होगा
+SESSION_TIMEOUT_SECONDS = 600  # 10 minutes inactivity timeout
 
 # ==========================================
 # 2. Global Browser और UnifiedSessionClient
@@ -66,6 +86,49 @@ def get_user_lock(chat_id: int) -> asyncio.Lock:
     if chat_id not in user_locks:
         user_locks[chat_id] = asyncio.Lock()
     return user_locks[chat_id]
+
+
+async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
+    """चेक करता है कि यूज़र ने कौन-कौन से चैनल्स/ग्रुप्स जॉइन नहीं किए हैं।"""
+    unjoined = []
+    for channel_id, info in CHANNELS.items():
+        try:
+            member = await bot.get_chat_member(chat_id=int(channel_id), user_id=user_id)
+            if member.status in ("left", "kicked", "restricted"):
+                unjoined.append(info)
+        except Exception:
+            unjoined.append(info)
+    return unjoined
+
+
+def build_join_keyboard(unjoined_channels: list[dict]) -> InlineKeyboardMarkup:
+    """सिर्फ बाकी बचे हुए चैनल्स के बटन और Verify बटन बनाता है।"""
+    keyboard = []
+    for ch in unjoined_channels:
+        keyboard.append([InlineKeyboardButton(text=ch["name"], url=ch["url"])])
+    keyboard.append([InlineKeyboardButton(text="✅ Verify Membership", callback_data="verify_join")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """अगर यूज़र ने सभी चैनल्स जॉइन नहीं किए हैं तो Access Denied दिखाकर जॉइन बटन भेजता है।"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    unjoined = await get_unjoined_channels(context.bot, user_id)
+    if not unjoined:
+        return True
+
+    await close_user_session(chat_id)
+    reply_markup = build_join_keyboard(unjoined)
+    msg_text = (
+        "🚫 **Access Denied!**\n\n"
+        "Bot ko use karne ke liye neeche diye gaye sabhi channels aur group join karna compulsory hai.\n"
+        "Join karne ke baad **'✅ Verify Membership'** par click karein:"
+    )
+    if update.message:
+        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+    return False
 
 
 async def get_shared_browser(headless: bool = True) -> Browser:
@@ -139,7 +202,7 @@ class UnifiedSessionClient:
     async def load_initial_page(self) -> dict:
         """Main page load करता है, cookies set करता है, और CSRF token व state options निकालता है।"""
         if not self.page:
-            raise RuntimeError("Session start नहीं हुआ है। पहले start() call करें।")
+            raise RuntimeError("Session start nahi hua hai. Pehle start() call karein.")
 
         await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=10000)
 
@@ -255,7 +318,7 @@ class UnifiedSessionClient:
         ताकि असली cookies, User-Agent, और sec-ch-ua headers ऑटोमैटिक सिंक रहें।
         """
         if not self.page:
-            raise RuntimeError("Page available नहीं है।")
+            raise RuntimeError("Page available nahi hai.")
 
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}/{endpoint.lstrip('/')}"
 
@@ -368,16 +431,16 @@ async def cleanup_loop():
 
 
 async def on_startup(application: Application):
-    """बॉट स्टार्ट होने पर Global Browser, Telegram Menu Commands, और बैकग्राउंड क्लीनअप टास्क चालू करता है।"""
+    """बॉट स्टार्ट होने पर Menu Commands सेट करता है, और Global Browser व क्लीनअप टास्क चालू करता है।"""
     global cleanup_task
-    await get_shared_browser(headless=True)
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Start a new session"),
             BotCommand("reset", "Reset current session"),
-            BotCommand("cancel", "Cancel & restart process"),
+            BotCommand("cancel", "Cancel current process"),
         ]
     )
+    await get_shared_browser(headless=True)
     cleanup_task = asyncio.create_task(cleanup_loop())
 
 
@@ -466,7 +529,7 @@ async def init_user_session(chat_id: int) -> bool:
                 }
                 return True
         except asyncio.TimeoutError:
-            print(f"[Session Init Timeout] Proxy {proxy_cfg.get('server') if proxy_cfg else 'None'} ने 15 सेकंड से अधिक समय लिया।")
+            print(f"[Session Init Timeout] Proxy {proxy_cfg.get('server') if proxy_cfg else 'None'} took more than 15s.")
         except Exception as e:
             print(f"[Session Init Error with proxy {proxy_cfg.get('server') if proxy_cfg else 'None'}]: {e}")
 
@@ -480,39 +543,93 @@ async def init_user_session(chat_id: int) -> bool:
 # ==========================================
 
 
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify Membership बटन क्लिक होने पर बचे हुए चैनल्स चेक करता है और एक्सेस देता है।"""
+    query = update.callback_query
+    if not query or query.message.chat.type != "private":
+        return
+
+    await query.answer()
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    unjoined = await get_unjoined_channels(context.bot, user_id)
+    if unjoined:
+        reply_markup = build_join_keyboard(unjoined)
+        await query.edit_message_text(
+            "🚫 **Verification Failed!**\n\n"
+            "Abhi bhi neeche diye gaye channels/group join karna baaki hai.\n"
+            "Inhe join karke dobara **'✅ Verify Membership'** dabayein:",
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return
+
+    async with get_user_lock(chat_id):
+        await query.edit_message_text("✅ Verification successful! Naya session initialize ho raha hai...")
+        token_ok = await init_user_session(chat_id)
+
+        if not token_ok:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Website se initial session token fetch nahi ho paya. Please internet check karein ya /reset dabayein.",
+            )
+            return
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🚀 Naya session start ho gaya hai.\nPlease apna 10-digit mobile number bhejein:",
+        )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_chat.type != "private":
+        return
+
+    if not await ensure_user_subscribed(update, context):
+        return
+
     chat_id = update.effective_chat.id
     async with get_user_lock(chat_id):
-        await update.message.reply_text("⏳ New session initialize ho raha hai, please wait...")
+        await update.message.reply_text("⏳ Naya session prepare ho raha hai...")
         token_ok = await init_user_session(chat_id)
 
         if not token_ok:
             await update.message.reply_text(
-                "⚠️ Warning: Website se initial session token fetch nahi ho paya. "
-                "Please apna internet connection check karein ya /reset press karke dobara try karein."
+                "⚠️ Website se initial session token fetch nahi ho paya. "
+                "Please internet connection check karein ya /reset dabakar retry karein."
             )
             return
 
-        await update.message.reply_text("✅ New session started!\nPlease apna 10-digit mobile number enter karein:")
+        await update.message.reply_text("🚀 Naya session start ho gaya hai.\nPlease apna 10-digit mobile number bhejein:")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_chat.type != "private":
+        return
+
+    if not await ensure_user_subscribed(update, context):
+        return
+
     chat_id = update.effective_chat.id
     async with get_user_lock(chat_id):
-        await update.message.reply_text("⏳ Session reset ho raha hai, please wait...")
+        await update.message.reply_text("⏳ Session reset ho raha hai...")
         token_ok = await init_user_session(chat_id)
 
         if not token_ok:
             await update.message.reply_text(
-                "⚠️ Website se session token fetch nahi ho paya. Please thodi der baad /reset press karein."
+                "⚠️ Website se session token fetch nahi ho paya. Please thodi der baad /reset dabayein."
             )
             return
 
-        await update.message.reply_text("🔄 Process reset ho gaya hai.\nPlease apna 10-digit mobile number enter karein:")
+        await update.message.reply_text("🔄 Process reset kar diya gaya hai.\nPlease naya 10-digit mobile number bhejein:")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.text or update.effective_chat.type != "private":
+        return
+
+    if not await ensure_user_subscribed(update, context):
         return
 
     chat_id = update.effective_chat.id
@@ -521,12 +638,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with get_user_lock(chat_id):
         session_data = user_sessions.get(chat_id)
         if not session_data:
-            await update.message.reply_text("⏳ Session initialize ho raha hai, please wait...")
+            await update.message.reply_text("⏳ Session initialize ho raha hai...")
             token_ok = await init_user_session(chat_id)
             if not token_ok:
-                await update.message.reply_text("⚠️ Website se connect nahi ho pa raha hai. Please /reset press karein.")
+                await update.message.reply_text("⚠️ Website se connect nahi ho pa raha hai. Please /reset dabayein.")
                 return
-            await update.message.reply_text("Please apna 10-digit mobile number enter karein:")
+            await update.message.reply_text("Please apna 10-digit mobile number bhejein:")
             return
 
         session_data["last_activity"] = time.time()
@@ -543,14 +660,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             session_data["mobile"] = text
             session_data["step"] = "AWAITING_CODE"
-            await update.message.reply_text("✅ Mobile number save ho gaya.\nAb apna Unique Code enter karein:")
+            await update.message.reply_text("✅ Mobile number save ho gaya.\nAb apna unique coupon code bhejein:")
 
         # ------------------------------------------
         # STEP 2: यूनिक कोड इनपुट और API Step 1 कॉल
         # ------------------------------------------
         elif current_step == "AWAITING_CODE":
             session_data["code"] = text.upper()
-            await update.message.reply_text("⏳ Processing request, please wait...")
+            await update.message.reply_text("⏳ Code verify ho raha hai, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -583,17 +700,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if not res_json.get("error", True):
                     session_data["step"] = "AWAITING_OTP"
-                    server_msg = res_json.get("messageBody") or "OTP send kar diya gaya hai."
-                    await update.message.reply_text(f"📩 {server_msg}\nPlease apna OTP enter karein:")
+                    server_msg = res_json.get("messageBody") or "OTP bhej diya gaya hai."
+                    await update.message.reply_text(f"📩 {server_msg}\nPlease received OTP enter karein:")
                 else:
                     error_msg = res_json.get("messageBody") or str(res_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi Unique Code dobara enter karein (ya naya number dalne ke liye /reset press karein):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi unique code dobara bhejein (ya naya number dalne ke liye /reset dabayein):"
                     )
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ Network ya API Error: {str(e)}\nReset karne ke liye /reset press karein.")
+                await update.message.reply_text(f"⚠️ Network ya API Error: {str(e)}\nReset karne ke liye /reset dabayein.")
 
         # ------------------------------------------
         # STEP 3: OTP वेरिफिकेशन
@@ -638,16 +755,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if res_2_json.get("error", True):
                     error_msg = res_2_json.get("messageBody") or str(res_2_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi OTP dobara enter karein (ya /reset press karein):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi OTP dobara enter karein (ya /reset dabayein):"
                     )
                     return
 
                 session_data["step"] = "AWAITING_UPI"
-                await update.message.reply_text("✅ OTP verify ho gaya!\nAb apni UPI ID enter karein (e.g., name@upi):")
+                await update.message.reply_text("✅ OTP verify ho gaya!\nAb apni UPI ID bhejein (e.g., name@upi):")
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset press karein.")
+                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset dabayein.")
 
         # ------------------------------------------
         # STEP 4: UPI ID इनपुट और फाइनल सबमिशन
@@ -693,21 +810,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     session_data["dynamic_token"] = res_3_json["token"]
 
                 if not res_3_json.get("error", True):
-                    success_msg = res_3_json.get("messageBody") or "Process successfully complete ho gaya hai!"
+                    success_msg = res_3_json.get("messageBody") or "Process successfully complete ho gaya!"
                     await update.message.reply_text(
                         f"🎉 {success_msg}\n\n"
-                        "🔄 Naya session start karne ke liye next mobile number ya /start bhejein:"
+                        "🔄 Naya session start karne ke liye agla mobile number ya /start bhejein:"
                     )
                     await close_user_session(chat_id)
                 else:
                     error_msg = res_3_json.get("messageBody") or str(res_3_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi UPI ID dobara enter karein (ya /reset press karein):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi UPI ID dobara enter karein (ya /reset dabayein):"
                     )
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset press karein.")
+                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset dabayein.")
 
 
 # ==========================================
@@ -724,10 +841,11 @@ if __name__ == "__main__":
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(CommandHandler("cancel", reset_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("reset", reset_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cancel", reset_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
 
     print("Bot is running...")
     app.run_polling()
