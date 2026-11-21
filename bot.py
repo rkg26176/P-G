@@ -146,7 +146,11 @@ async def get_shared_browser(headless: bool = True) -> Browser:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--ignore-certificate-errors",
             ],
         )
         return global_browser
@@ -182,6 +186,7 @@ class UnifiedSessionClient:
             "has_touch": is_mobile,
             "locale": "en-IN",
             "timezone_id": "Asia/Kolkata",
+            "ignore_https_errors": True,
         }
 
         if self.proxy_cfg and self.proxy_cfg.get("server"):
@@ -204,7 +209,7 @@ class UnifiedSessionClient:
         if not self.page:
             raise RuntimeError("Session start nahi hua hai. Pehle start() call karein.")
 
-        await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=10000)
+        await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=15000)
 
         try:
             await self.page.wait_for_selector(
@@ -493,7 +498,7 @@ async def init_user_session(chat_id: int) -> bool:
                 await client.start()
                 return await client.load_initial_page()
 
-            page_info = await asyncio.wait_for(_connect_and_load(), timeout=15.0)
+            page_info = await asyncio.wait_for(_connect_and_load(), timeout=20.0)
             verification_token = page_info.get("csrf_token", "")
             scraped_states = page_info.get("states", [])
 
@@ -529,7 +534,7 @@ async def init_user_session(chat_id: int) -> bool:
                 }
                 return True
         except asyncio.TimeoutError:
-            print(f"[Session Init Timeout] Proxy {proxy_cfg.get('server') if proxy_cfg else 'None'} took more than 15s.")
+            print(f"[Session Init Timeout] Proxy {proxy_cfg.get('server') if proxy_cfg else 'None'} took more than 20s.")
         except Exception as e:
             print(f"[Session Init Error with proxy {proxy_cfg.get('server') if proxy_cfg else 'None'}]: {e}")
 
