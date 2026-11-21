@@ -4,7 +4,7 @@ import random
 import time
 from typing import Optional
 from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -322,14 +322,14 @@ async def safe_post_json(client: UnifiedSessionClient, url: str, payload: dict) 
     res = await client.post_step(url, payload)
 
     if res["status"] != 200:
-        raise RuntimeError(f"HTTP {res['status']}: सर्वर ने रिक्वेस्ट अस्वीकार कर दी।")
+        raise RuntimeError(f"HTTP {res['status']}: Server ne request reject kar di.")
 
     data = res["data"]
     if isinstance(data, dict) and "raw" in data and len(data) == 1:
         raw_content = data["raw"].strip()
         if raw_content.startswith("<") or "<html" in raw_content.lower():
-            raise RuntimeError("सर्वर या सुरक्षा फ़ायरवॉल (WAF) ने सेशन ब्लॉक कर दिया है या सेशन समाप्त हो गया है।")
-        raise RuntimeError("सर्वर से अमान्य (Non-JSON) रिस्पॉन्स प्राप्त हुआ है।")
+            raise RuntimeError("Server ya security firewall (WAF) ne session block kar diya hai ya session expire ho gaya hai.")
+        raise RuntimeError("Server se invalid (Non-JSON) response mila hai.")
 
     return data
 
@@ -368,9 +368,16 @@ async def cleanup_loop():
 
 
 async def on_startup(application: Application):
-    """बॉट स्टार्ट होने पर Global Browser और बैकग्राउंड क्लीनअप टास्क चालू करता है।"""
+    """बॉट स्टार्ट होने पर Global Browser, Telegram Menu Commands, और बैकग्राउंड क्लीनअप टास्क चालू करता है।"""
     global cleanup_task
     await get_shared_browser(headless=True)
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Start a new session"),
+            BotCommand("reset", "Reset current session"),
+            BotCommand("cancel", "Cancel & restart process"),
+        ]
+    )
     cleanup_task = asyncio.create_task(cleanup_loop())
 
 
@@ -476,32 +483,32 @@ async def init_user_session(chat_id: int) -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     async with get_user_lock(chat_id):
-        await update.message.reply_text("⏳ नया सेशन तैयार हो रहा है...")
+        await update.message.reply_text("⏳ New session initialize ho raha hai, please wait...")
         token_ok = await init_user_session(chat_id)
 
         if not token_ok:
             await update.message.reply_text(
-                "⚠️ चेतावनी: वेबसाइट से शुरुआती सेशन टोकन प्राप्त नहीं हो सका। "
-                "कृपया इंटरनेट/प्रॉक्सी कनेक्शन जांचें या /reset दबाकर दोबारा प्रयास करें।"
+                "⚠️ Warning: Website se initial session token fetch nahi ho paya. "
+                "Please apna internet connection check karein ya /reset press karke dobara try karein."
             )
             return
 
-        await update.message.reply_text("नया सेशन शुरू हो गया है।\nकृपया अपना 10-अंकों का मोबाइल नंबर भेजें:")
+        await update.message.reply_text("✅ New session started!\nPlease apna 10-digit mobile number enter karein:")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     async with get_user_lock(chat_id):
-        await update.message.reply_text("⏳ सेशन रीसेट हो रहा है...")
+        await update.message.reply_text("⏳ Session reset ho raha hai, please wait...")
         token_ok = await init_user_session(chat_id)
 
         if not token_ok:
             await update.message.reply_text(
-                "⚠️ वेबसाइट से सेशन टोकन प्राप्त नहीं हो सका। कृपया थोड़ी देर बाद /reset दबाएं।"
+                "⚠️ Website se session token fetch nahi ho paya. Please thodi der baad /reset press karein."
             )
             return
 
-        await update.message.reply_text("प्रोसेस रीसेट कर दिया गया है।\nकृपया नया मोबाइल नंबर भेजें:")
+        await update.message.reply_text("🔄 Process reset ho gaya hai.\nPlease apna 10-digit mobile number enter karein:")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -514,12 +521,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with get_user_lock(chat_id):
         session_data = user_sessions.get(chat_id)
         if not session_data:
-            await update.message.reply_text("⏳ सेशन प्रारंभ हो रहा है...")
+            await update.message.reply_text("⏳ Session initialize ho raha hai, please wait...")
             token_ok = await init_user_session(chat_id)
             if not token_ok:
-                await update.message.reply_text("⚠️ वेबसाइट से कनेक्ट नहीं हो पा रहा है। कृपया /reset दबाएं।")
+                await update.message.reply_text("⚠️ Website se connect nahi ho pa raha hai. Please /reset press karein.")
                 return
-            await update.message.reply_text("कृपया अपना 10-अंकों का मोबाइल नंबर भेजें:")
+            await update.message.reply_text("Please apna 10-digit mobile number enter karein:")
             return
 
         session_data["last_activity"] = time.time()
@@ -531,19 +538,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ------------------------------------------
         if current_step == "AWAITING_MOBILE":
             if not (text.isdigit() and len(text) == 10):
-                await update.message.reply_text("❌ कृपया सही 10-अंकों का मोबाइल नंबर दर्ज करें:")
+                await update.message.reply_text("❌ Invalid number! Please sahi 10-digit mobile number enter karein:")
                 return
 
             session_data["mobile"] = text
             session_data["step"] = "AWAITING_CODE"
-            await update.message.reply_text("✅ नंबर सेव हो गया।\nअब अपना यूनिक कोड भेजें:")
+            await update.message.reply_text("✅ Mobile number save ho gaya.\nAb apna Unique Code enter karein:")
 
         # ------------------------------------------
         # STEP 2: यूनिक कोड इनपुट और API Step 1 कॉल
         # ------------------------------------------
         elif current_step == "AWAITING_CODE":
             session_data["code"] = text.upper()
-            await update.message.reply_text("⏳ प्रोसेस हो रहा है, कृपया प्रतीक्षा करें...")
+            await update.message.reply_text("⏳ Processing request, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -576,28 +583,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if not res_json.get("error", True):
                     session_data["step"] = "AWAITING_OTP"
-                    server_msg = res_json.get("messageBody") or "OTP भेज दिया गया है।"
-                    await update.message.reply_text(f"📩 {server_msg}\nकृपया प्राप्त हुआ OTP दर्ज करें:")
+                    server_msg = res_json.get("messageBody") or "OTP send kar diya gaya hai."
+                    await update.message.reply_text(f"📩 {server_msg}\nPlease apna OTP enter karein:")
                 else:
                     error_msg = res_json.get("messageBody") or str(res_json)
                     await update.message.reply_text(
-                        f"❌ वेबसाइट एरर: {error_msg}\nकृपया सही यूनिक कोड दोबारा दर्ज करें (या नया नंबर डालने के लिए /reset दबाएं):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi Unique Code dobara enter karein (ya naya number dalne ke liye /reset press karein):"
                     )
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ नेटवर्क या API एरर: {str(e)}\nरीसेट करने के लिए /reset दबाएं।")
+                await update.message.reply_text(f"⚠️ Network ya API Error: {str(e)}\nReset karne ke liye /reset press karein.")
 
         # ------------------------------------------
         # STEP 3: OTP वेरिफिकेशन
         # ------------------------------------------
         elif current_step == "AWAITING_OTP":
             if not text.isdigit():
-                await update.message.reply_text("❌ कृपया केवल अंकों में सही OTP दर्ज करें:")
+                await update.message.reply_text("❌ Invalid OTP! Please sirf digits mein sahi OTP enter karein:")
                 return
 
             session_data["otp"] = text
-            await update.message.reply_text("⏳ OTP वेरिफाई हो रहा है...")
+            await update.message.reply_text("⏳ OTP verify ho raha hai, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -631,27 +638,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if res_2_json.get("error", True):
                     error_msg = res_2_json.get("messageBody") or str(res_2_json)
                     await update.message.reply_text(
-                        f"❌ वेबसाइट एरर: {error_msg}\nकृपया सही OTP दोबारा दर्ज करें (या /reset दबाएं):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi OTP dobara enter karein (ya /reset press karein):"
                     )
                     return
 
                 session_data["step"] = "AWAITING_UPI"
-                await update.message.reply_text("✅ OTP वेरिफाई हो गया!\nअब अपनी UPI ID भेजें (जैसे: name@upi):")
+                await update.message.reply_text("✅ OTP verify ho gaya!\nAb apni UPI ID enter karein (e.g., name@upi):")
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ सर्वर एरर: {str(e)}\nरीसेट करने के लिए /reset दबाएं।")
+                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset press karein.")
 
         # ------------------------------------------
         # STEP 4: UPI ID इनपुट और फाइनल सबमिशन
         # ------------------------------------------
         elif current_step == "AWAITING_UPI":
             if "@" not in text or len(text) < 5:
-                await update.message.reply_text("❌ कृपया सही UPI ID दर्ज करें (जिसमें '@' शामिल हो):")
+                await update.message.reply_text("❌ Invalid UPI ID! Please sahi UPI ID enter karein (jisme '@' shamil ho):")
                 return
 
             session_data["upi_id"] = text
-            await update.message.reply_text("⏳ फाइनल सबमिट हो रहा है, कृपया प्रतीक्षा करें...")
+            await update.message.reply_text("⏳ Final submit ho raha hai, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -686,21 +693,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     session_data["dynamic_token"] = res_3_json["token"]
 
                 if not res_3_json.get("error", True):
-                    success_msg = res_3_json.get("messageBody") or "प्रोसेस सफलतापूर्वक पूरा हो गया!"
+                    success_msg = res_3_json.get("messageBody") or "Process successfully complete ho gaya hai!"
                     await update.message.reply_text(
                         f"🎉 {success_msg}\n\n"
-                        "🔄 नया सेशन शुरू करने के लिए अगला मोबाइल नंबर या /start भेजें:"
+                        "🔄 Naya session start karne ke liye next mobile number ya /start bhejein:"
                     )
                     await close_user_session(chat_id)
                 else:
                     error_msg = res_3_json.get("messageBody") or str(res_3_json)
                     await update.message.reply_text(
-                        f"❌ वेबसाइट एरर: {error_msg}\nकृपया सही UPI ID दोबारा दर्ज करें (या /reset दबाएं):"
+                        f"❌ Website Error: {error_msg}\nPlease sahi UPI ID dobara enter karein (ya /reset press karein):"
                     )
 
             except Exception as e:
                 await close_user_session(chat_id)
-                await update.message.reply_text(f"⚠️ सर्वर एरर: {str(e)}\nरीसेट करने के लिए /reset दबाएं।")
+                await update.message.reply_text(f"⚠️ Server Error: {str(e)}\nReset karne ke liye /reset press karein.")
 
 
 # ==========================================
