@@ -52,6 +52,17 @@ MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
 WAIT_SECONDS = 10  # Wait duration in seconds per OTP check cycle
+SMS_WAIT_TIMEOUT = float(WAIT_SECONDS)
+
+OTP_KEYWORDS = ["VM-QWKCLR-S", "otp", "code", "verification", "login"]
+OTP_PATTERNS = [
+    re.compile(r"Use OTP (\d{6}) to log into your Swiggy account", re.IGNORECASE),
+    re.compile(r"(\d{6})\s+is your Swiggy", re.IGNORECASE),
+    re.compile(r"VM-QWKCLR-S.*?OTP.*?(\d{6})", re.IGNORECASE),
+    re.compile(r"login code[:\s]*(\d{6})", re.IGNORECASE),
+    re.compile(r"verification code[:\s]*(\d{6})", re.IGNORECASE),
+    re.compile(r"(?<!\d)(\d{6})(?!\d)"),
+]
 
 file_lock = asyncio.Lock()
 active_claim_tasks: dict[int, asyncio.Task] = {}
@@ -228,7 +239,7 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
     reply_markup = build_join_keyboard(unjoined)
     msg_text = (
         "🚫 **Access Denied**\n\n"
-        "To use this bot, please join all required channels and the community group listed below.\n"
+        "To use this bot, you must join all required channels and the community group listed below.\n"
         "Once joined, click **'✅ Verify Membership'** to proceed:"
     )
     if update.callback_query:
@@ -1288,37 +1299,93 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
     return chosen
 
 
-def _extract_otp_for_target_number_from_payload(payload_val, target_number: str) -> list[str]:
-    """Searches structured/unstructured Firebase payload strictly for 6-digit OTPs tied to target_number."""
-    matched_otps: list[str] = []
-    num_clean = str(target_number).strip()
-    if not num_clean:
-        return matched_otps
+def _http_raw_sync(method: str, url: str, timeout: float = 8) -> tuple[int, Optional[dict]]:
+    try:
+        res = requests.request(method, url, timeout=timeout)
+        try:
+            data = res.json()
+        except Exception:
+            data = None
+        return res.status_code, data if isinstance(data, dict) else None
+    except Exception:
+        return 0, None
 
-    def _scan_node(node):
-        if isinstance(node, dict):
-            node_str = json.dumps(node, ensure_ascii=False)
-            if num_clean in node_str:
-                found = extract_numbers_and_otps(node_str).get("otps", [])
-                for o in found:
-                    if len(o) == 6 and o != num_clean[-6:] and o not in matched_otps:
-                        matched_otps.append(o)
-            for v in node.values():
-                if isinstance(v, (dict, list)):
-                    _scan_node(v)
-        elif isinstance(node, list):
-            for item in node:
-                if isinstance(item, (dict, list)):
-                    _scan_node(item)
-                elif isinstance(item, str) and num_clean in item:
-                    for o in extract_numbers_and_otps(item).get("otps", []):
-                        if len(o) == 6 and o not in matched_otps:
-                            matched_otps.append(o)
 
-    if isinstance(payload_val, (dict, list)):
-        _scan_node(payload_val)
+async def _http_raw(method: str, url: str, timeout: float = 8) -> tuple[int, Optional[dict]]:
+    return await asyncio.to_thread(_http_raw_sync, method, url, timeout)
 
-    return matched_otps
+
+async def fetch_otp_from_firebase(
+    fb_url: str,
+    client_id: str,
+    trigger_ms: int,
+    timeout: float = SMS_WAIT_TIMEOUT,
+    exclude: Optional[set] = None,
+) -> Optional[str]:
+    exclude = exclude or set()
+    start = time.time()
+    floor = int(trigger_ms) - 5000
+    root_url, query = _get_firebase_root_and_query(fb_url)
+    base = root_url.rstrip("/")
+    q_suffix = f"?{query}" if query else ""
+    cid = str(client_id or "").strip()
+
+    raw_paths = [
+        f"{base}/messages/{cid}.json",
+        f"{base}/All_User/Sms/{cid}.json",
+        f"{base}/All_Users/Sms/{cid}.json",
+        f"{base}/user_sms/{cid}.json",
+        f"{base}/sms/{cid}.json",
+        f"{base}/Sms/{cid}.json",
+    ] if cid else [
+        f"{base}/messages.json",
+        f"{base}/All_User/Sms.json",
+        f"{base}/All_Users/Sms.json",
+        f"{base}/user_sms.json",
+        f"{base}/sms.json",
+        f"{base}/Sms.json",
+        _build_firebase_query_url(fb_url, ""),
+    ]
+    paths = list(dict.fromkeys(p + q_suffix for p in raw_paths))
+
+    text_fields = (
+        "body", "message", "text", "sms", "msg", "content",
+        "message_body", "Message", "Body", "Text", "SMS",
+    )
+
+    while time.time() - start < timeout:
+        for url in paths:
+            status, data = await _http_raw("GET", url, timeout=8)
+            if status != 200 or not isinstance(data, dict) or not data:
+                continue
+            for mid in sorted(data.keys(), reverse=True):
+                msg = data[mid]
+                if not isinstance(msg, dict):
+                    continue
+                try:
+                    if int(mid) < floor:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                text = ""
+                for f in text_fields:
+                    v = msg.get(f)
+                    if v:
+                        text = str(v)
+                        break
+                if not text:
+                    continue
+                if not any(kw in text.lower() for kw in OTP_KEYWORDS):
+                    continue
+                for pat in OTP_PATTERNS:
+                    m = pat.search(text)
+                    if m:
+                        otp = m.group(1) if m.groups() else m.group(0)
+                        otp = re.sub(r"\D", "", otp)
+                        if len(otp) == 6 and otp not in exclude:
+                            return otp
+        await asyncio.sleep(0.5)
+    return None
 
 
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
@@ -1339,15 +1406,29 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
             res = requests.get(target_url, timeout=5)
             if res.status_code == 200 and res.json() is not None:
                 payload_val = res.json()
-                if number_id:
-                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(payload_val).strip())
-                    if matched and matched.group(1) not in baseline_otps:
-                        return matched.group(1)
-                else:
-                    targeted = _extract_otp_for_target_number_from_payload(payload_val, number)
-                    for candidate_otp in targeted:
-                        if len(candidate_otp) == 6 and candidate_otp not in baseline_otps:
-                            return candidate_otp
+                if isinstance(payload_val, dict):
+                    for mid in sorted(payload_val.keys(), reverse=True):
+                        msg = payload_val[mid]
+                        if isinstance(msg, dict):
+                            text = ""
+                            for f in (
+                                "body", "message", "text", "sms", "msg", "content",
+                                "message_body", "Message", "Body", "Text", "SMS",
+                            ):
+                                v = msg.get(f)
+                                if v:
+                                    text = str(v)
+                                    break
+                            if text and any(kw in text.lower() for kw in OTP_KEYWORDS):
+                                for pat in OTP_PATTERNS:
+                                    m = pat.search(text)
+                                    if m:
+                                        otp = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
+                                        if len(otp) == 6 and otp not in baseline_otps:
+                                            return otp
+                matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(payload_val).strip())
+                if matched and matched.group(1) not in baseline_otps:
+                    return matched.group(1)
         except Exception:
             pass
         time.sleep(1)
@@ -1535,6 +1616,7 @@ async def auto_claim_triplet_on_woohoo(
                     if prev_otp not in baseline_otps:
                         baseline_otps.append(prev_otp)
 
+                trigger_ms = int(time.time() * 1000)
                 recaptcha_token = await client.get_dynamic_token(action="submit")
                 payload_step_1 = {
                     "__RequestVerificationToken": dynamic_token,
@@ -1572,13 +1654,21 @@ async def auto_claim_triplet_on_woohoo(
 
                 await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Waiting {WAIT_SECONDS}s for OTP)...")
 
-                received_otp = await asyncio.to_thread(
-                    _poll_otp_for_number_sync,
-                    fb_url,
-                    phone,
-                    num_id,
-                    baseline_otps,
+                received_otp = await fetch_otp_from_firebase(
+                    fb_url=fb_url,
+                    client_id=str(num_id or ""),
+                    trigger_ms=trigger_ms,
+                    timeout=SMS_WAIT_TIMEOUT,
+                    exclude=set(baseline_otps),
                 )
+                if not received_otp:
+                    received_otp = await asyncio.to_thread(
+                        _poll_otp_for_number_sync,
+                        fb_url,
+                        phone,
+                        num_id,
+                        baseline_otps,
+                    )
                 if received_otp and len(received_otp) == 6 and received_otp.isdigit() and received_otp not in used_otps_global:
                     break
                 received_otp = None
@@ -3593,7 +3683,7 @@ async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAU
         if upi_text == "Claim Coupon":
             await handle_claim_coupon_menu(update, context)
             return ConversationHandler.END
-        elif user_text == "Check Coupon":
+        elif upi_text == "Check Coupon":
             return await handle_check_coupon_menu(update, context)
         else:
             await handle_other_main_buttons(update, context)
