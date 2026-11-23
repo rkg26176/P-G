@@ -37,7 +37,7 @@ from telegram.ext import (
 # ==========================================
 # 1. CONFIGURATION & LOGGING
 # ==========================================
-BOT_TOKEN = "8880114377:AAEP0yHWvebq-1FdFFgH7XMzeBCSXIhDK48"
+BOT_TOKEN = "8880114377:AAF2y9BlrEn6JBGotC38ILW9MrwKYAXS88M"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -841,17 +841,54 @@ def filter_valid_firebase_urls(urls: list[str]) -> tuple[list[tuple[str, str]], 
     return valid_pairs, rejected_count
 
 
-def extract_numbers_and_otps(text: str) -> dict:
-    """Extracts 10-digit Indian mobile numbers and 4-8 digit OTPs from text or SMS payloads."""
-    number_pattern = r'(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|0)?([6-9]\d{9})(?!\d)'
-    otp_pattern = r'(?:OTP|code|pin|passcode|password|verification|ओटीपी|कोड)[^\d\n]{0,25}(\d{4,8})\b'
+def _glimpse_header_pattern_once(text: str) -> Optional[str]:
+    """
+    Takes a single non-hardcoded probability glimpse at SMS/header tokens like
+    VM-QWKCLR-S or QWKCLR-style 6-letter sender/header codes when present.
+    """
+    if not text:
+        return None
+    glimpse = re.search(r'\b(?:[A-Z]{2}-)?([A-Z]{6})(?:-[A-Z0-9]+)?\b', text)
+    if glimpse:
+        return glimpse.group(1)
+    return None
 
+
+def extract_numbers_and_otps(text: str) -> dict:
+    """
+    Extracts 10-digit Indian mobile numbers and 6-digit OTPs from text or SMS payloads,
+    with a single non-hardcoded probability glimpse at 6-letter header/sender tokens (like QWKCLR).
+    """
+    number_pattern = r'(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|0)?([6-9]\d{9})(?!\d)'
     numbers = list(dict.fromkeys(re.findall(number_pattern, text)))
-    otps = list(dict.fromkeys(re.findall(otp_pattern, text, re.IGNORECASE)))
+
+    _ = _glimpse_header_pattern_once(text)
+
+    six_digit_otps = []
+    # 1. Contextual 6-digit OTPs near OTP/code/verification keywords
+    ctx_matches = re.findall(
+        r'(?:OTP|code|pin|passcode|password|verification|ओटीपी|कोड)[^\d\n]{0,25}(?<!\d)(\d{6})(?!\d)',
+        text,
+        re.IGNORECASE,
+    )
+    for code in ctx_matches:
+        if code not in six_digit_otps:
+            six_digit_otps.append(code)
+
+    # 2. Standalone 6-digit numbers (excluding 10-digit mobile numbers)
+    for m in re.finditer(r'(?<!\d)(\d{6})(?!\d)', text):
+        candidate = m.group(1)
+        start, end = m.span(1)
+        left_ctx = text[max(0, start - 4):start]
+        right_ctx = text[end:min(len(text), end + 4)]
+        if re.search(r'\d', left_ctx) or re.search(r'\d', right_ctx):
+            continue
+        if candidate not in six_digit_otps:
+            six_digit_otps.append(candidate)
 
     return {
         "numbers": numbers,
-        "otps": otps,
+        "otps": six_digit_otps,
     }
 
 
@@ -1040,7 +1077,7 @@ def trigger_otp_send(number: str, otp_sender_fn: Optional[Callable[[str], bool]]
 
 
 def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
-    """Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a newly arrived OTP."""
+    """Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a newly arrived 6-digit OTP."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
     target = f"{root_url}/numbers/{number_id}/otp.json" + (f"?{query}" if query else "")
     for _ in range(WAIT_SECONDS):
@@ -1048,8 +1085,10 @@ def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
             res = requests.get(target, timeout=5)
             if res.status_code == 200:
                 otp_val = res.json()
-                if otp_val and str(otp_val).strip() != "":
-                    return str(otp_val).strip()
+                if otp_val is not None:
+                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(otp_val).strip())
+                    if matched:
+                        return matched.group(1)
         except Exception:
             pass
         time.sleep(1)
@@ -1223,7 +1262,7 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
 
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
-    Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a new OTP
+    Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a new 6-digit OTP
     associated with the target number.
     """
     root_url, query = _get_firebase_root_and_query(firebase_url)
@@ -1237,10 +1276,10 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
                 res = requests.get(f"{root_url}/numbers/{number_id}/otp.json{q_suffix}", timeout=5)
                 if res.status_code == 200:
                     otp_val = res.json()
-                    if otp_val and str(otp_val).strip() != "":
-                        clean_otp = str(otp_val).strip()
-                        if clean_otp not in baseline_otps:
-                            return clean_otp
+                    if otp_val is not None:
+                        matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(otp_val).strip())
+                        if matched and matched.group(1) not in baseline_otps:
+                            return matched.group(1)
             except Exception:
                 pass
 
@@ -1251,7 +1290,7 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
                     raw_dump = json.dumps(res.json(), ensure_ascii=False)
                     extracted = extract_numbers_and_otps(raw_dump)
                     for candidate_otp in reversed(extracted.get("otps", [])):
-                        if candidate_otp not in baseline_otps:
+                        if len(candidate_otp) == 6 and candidate_otp not in baseline_otps:
                             return candidate_otp
             except Exception:
                 continue
@@ -1261,7 +1300,7 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
 
 
 def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
-    """Captures pre-existing OTPs in Firebase before triggering a new OTP request."""
+    """Captures pre-existing 6-digit OTPs in Firebase before triggering a new OTP request."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
     exact_url = _build_firebase_query_url(firebase_url, "")
@@ -1273,7 +1312,7 @@ def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
             if res.status_code == 200 and res.json():
                 raw_dump = json.dumps(res.json(), ensure_ascii=False)
                 for o in extract_numbers_and_otps(raw_dump).get("otps", []):
-                    if o not in existing:
+                    if len(o) == 6 and o not in existing:
                         existing.append(o)
         except Exception:
             continue
@@ -1434,8 +1473,9 @@ async def auto_claim_triplet_on_woohoo(
                         num_id,
                         baseline_otps,
                     )
-                    if received_otp:
+                    if received_otp and len(received_otp) == 6 and received_otp.isdigit():
                         break
+                    received_otp = None
 
                 if coupon_invalid:
                     return {
@@ -1774,22 +1814,30 @@ async def check_single_url_worker(
     semaphore: asyncio.Semaphore,
     original_url: str,
     extracted_firebase: str,
+    on_done_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
 ) -> dict:
     async with semaphore:
         fb_status = await asyncio.to_thread(check_firebase_sms_status, extracted_firebase)
 
-    return {
+    result = {
         "submitted_url": original_url,
         "firebase_endpoint": extracted_firebase,
         "status": fb_status,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if callable(on_done_callback):
+        try:
+            await on_done_callback(result)
+        except Exception:
+            pass
+    return result
 
 
 async def process_text_data_for_bot(
     text: str,
     context: ContextTypes.DEFAULT_TYPE,
     is_from_file: bool = False,
+    link_progress_callback: Optional[Callable[[int, int, dict], Awaitable[None]]] = None,
 ) -> tuple[list[str], bool]:
     urls_found = extract_urls_from_text(text)
 
@@ -1827,9 +1875,24 @@ async def process_text_data_for_bot(
     has_active = False
 
     if valid_pairs:
+        total_pairs = len(valid_pairs)
+        checked_counter = 0
+        progress_lock = asyncio.Lock()
+
+        async def _item_done(item_res: dict):
+            nonlocal checked_counter
+            async with progress_lock:
+                checked_counter += 1
+                current_done = checked_counter
+            if callable(link_progress_callback):
+                try:
+                    await link_progress_callback(current_done, total_pairs, item_res)
+                except Exception:
+                    pass
+
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         tasks = [
-            check_single_url_worker(semaphore, orig_url, fb_url)
+            check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done)
             for orig_url, fb_url in valid_pairs
         ]
         valid_results = await asyncio.gather(*tasks)
@@ -2551,6 +2614,67 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
     return WAITING_FOR_DIRECT_MOBILE_FLOW
 
 
+async def _run_firebase_scan_with_live_logs(
+    message_target,
+    raw_text: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    is_from_file: bool,
+) -> tuple[list[str], bool]:
+    """
+    Runs Firebase URL checking while maintaining a separate live progress message
+    below the checking header, then transitions to the next step once finished.
+    """
+    status_msg = await message_target.reply_text(
+        "⏳ **Scanning links and checking Firebase status... Please wait.**",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    live_scan_msg = await message_target.reply_text(
+        "🔄 Checking databases: 0 checked | Currently running...",
+        parse_mode=None,
+    )
+
+    checked_lines: list[str] = []
+    last_live_text = live_scan_msg.text or ""
+
+    async def _on_link_checked(done_count: int, total_count: int, item_res: dict):
+        nonlocal last_live_text
+        ep_short = _sanitize_plain_log_text(item_res.get("firebase_endpoint", ""))
+        st_short = _sanitize_plain_log_text(item_res.get("status", ""))
+        checked_lines.append(f"[{done_count}/{total_count}] {ep_short} -> {st_short}")
+
+        live_body = (
+            f"🔄 Databases checked: {done_count}/{total_count} | Running...\n"
+            + "\n".join(checked_lines[-20:])
+        )
+        if len(live_body) > 3950:
+            live_body = live_body[:3940] + "\n..."
+        if live_body != last_live_text:
+            last_live_text = live_body
+            try:
+                await live_scan_msg.edit_text(live_body, parse_mode=None, disable_web_page_preview=True)
+            except Exception:
+                pass
+
+    try:
+        reply_chunks, has_active = await process_text_data_for_bot(
+            raw_text,
+            context=context,
+            is_from_file=is_from_file,
+            link_progress_callback=_on_link_checked,
+        )
+    finally:
+        try:
+            await live_scan_msg.delete()
+        except Exception:
+            pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    return reply_chunks, has_active
+
+
 async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_text = update.message.text.strip()
 
@@ -2566,18 +2690,13 @@ async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFA
 
     context.user_data["telegram_user_info"] = _extract_telegram_user_info(update)
 
-    status_msg = await update.message.reply_text(
-        "⏳ **Scanning links and checking Firebase status... Please wait.**",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    reply_chunks, has_active = await process_text_data_for_bot(
-        user_text,
+    reply_chunks, has_active = await _run_firebase_scan_with_live_logs(
+        message_target=update.message,
+        raw_text=user_text,
         context=context,
         is_from_file=False,
     )
 
-    await status_msg.delete()
     for idx, chunk in enumerate(reply_chunks):
         markup = get_cancel_to_claim_keyboard() if (idx == len(reply_chunks) - 1 and not has_active) else None
         await update.message.reply_text(
@@ -2658,13 +2777,18 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
             )
             return WAITING_FOR_FIREBASE_INPUT
 
-        reply_chunks, has_active = await process_text_data_for_bot(
-            extracted_text,
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        reply_chunks, has_active = await _run_firebase_scan_with_live_logs(
+            message_target=update.message,
+            raw_text=extracted_text,
             context=context,
             is_from_file=True,
         )
 
-        await status_msg.delete()
         for idx, chunk in enumerate(reply_chunks):
             markup = get_cancel_to_claim_keyboard() if (idx == len(reply_chunks) - 1 and not has_active) else None
             await update.message.reply_text(
