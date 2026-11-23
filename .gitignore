@@ -6,3 +6,9 @@ venv/
 env/
 .env
 .DS_Store
+
+# Bot runtime data & temporary files
+claimed_coupons.json
+*.zip
+*.txt
+!requirements.txt
