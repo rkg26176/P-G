@@ -1280,6 +1280,12 @@ def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
     return existing
 
 
+def _sanitize_plain_log_text(raw: str) -> str:
+    """Strips Markdown formatting characters so live/plain logs never trigger entity parse errors."""
+    cleaned = re.sub(r"[*_`\[\]~]+", "", str(raw or ""))
+    return " ".join(cleaned.split())
+
+
 async def auto_claim_triplet_on_woohoo(
     context: ContextTypes.DEFAULT_TYPE,
     coupon_code: str,
@@ -1308,12 +1314,12 @@ async def auto_claim_triplet_on_woohoo(
     async def _notify_progress(status_line: str):
         if callable(progress_callback):
             try:
-                await progress_callback(status_line, list(failed_logs))
+                await progress_callback(_sanitize_plain_log_text(status_line), list(failed_logs))
             except Exception:
                 pass
 
     for fb_url in active_endpoints:
-        await _notify_progress(f"Scanning online numbers from `{fb_url}`...")
+        await _notify_progress(f"Scanning online numbers from {fb_url}...")
         structured_online = await asyncio.to_thread(get_online_numbers, fb_url)
         candidates = []
         if structured_online:
@@ -1337,7 +1343,7 @@ async def auto_claim_triplet_on_woohoo(
             if phone not in used_numbers:
                 used_numbers.append(phone)
 
-            await _notify_progress(f"Initializing session for `{phone}`...")
+            await _notify_progress(f"Initializing session for {phone}...")
 
             selected_device = random.choice(DEVICE_PROFILES)
             proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
@@ -1356,8 +1362,8 @@ async def auto_claim_triplet_on_woohoo(
 
                 if not dynamic_token:
                     last_error_msg = "Failed to fetch initial session token from the website."
-                    failed_logs.append(f"❌ `{phone}` — Failed (Session token error)")
-                    await _notify_progress(f"Session failed for `{phone}`, switching...")
+                    failed_logs.append(f"❌ {phone} — Failed (Session token error)")
+                    await _notify_progress(f"Session failed for {phone}, switching...")
                     continue
 
                 matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
@@ -1378,7 +1384,7 @@ async def auto_claim_triplet_on_woohoo(
                 step1_error_reason = ""
 
                 for attempt in range(1, MAX_SEND_RETRIES + 1):
-                    await _notify_progress(f"Trying `{phone}` (Attempt {attempt}/{MAX_SEND_RETRIES} — Sending OTP)...")
+                    await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Sending OTP)...")
 
                     if num_id:
                         await asyncio.to_thread(clear_old_otp, fb_url, num_id)
@@ -1413,13 +1419,13 @@ async def auto_claim_triplet_on_woohoo(
                     if res_1.get("error", True):
                         err_body = str(res_1.get("messageBody") or res_1)
                         last_error_msg = err_body
-                        step1_error_reason = err_body
+                        step1_error_reason = _sanitize_plain_log_text(err_body)[:60]
                         if any(k in err_body.lower() for k in ("invalid coupon", "already used", "already claimed", "expired", "not valid")):
                             coupon_invalid = True
                             break
                         continue
 
-                    await _notify_progress(f"Trying `{phone}` (Attempt {attempt}/{MAX_SEND_RETRIES} — Waiting {WAIT_SECONDS}s for OTP)...")
+                    await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Waiting {WAIT_SECONDS}s for OTP)...")
 
                     received_otp = await asyncio.to_thread(
                         _poll_otp_for_number_sync,
@@ -1442,12 +1448,12 @@ async def auto_claim_triplet_on_woohoo(
                 if not received_otp:
                     reason_short = step1_error_reason if step1_error_reason else f"No OTP after {MAX_SEND_RETRIES} attempts"
                     last_error_msg = f"No OTP received on {phone} after {MAX_SEND_RETRIES} attempts."
-                    failed_logs.append(f"❌ `{phone}` — Failed ({reason_short})")
-                    await _notify_progress(f"Number `{phone}` failed, switching to next...")
+                    failed_logs.append(f"❌ {phone} — Failed ({reason_short})")
+                    await _notify_progress(f"Number {phone} failed, switching to next...")
                     continue
 
                 # STEP 2: OTP Verification
-                await _notify_progress(f"OTP `{received_otp}` received on `{phone}` — Verifying OTP...")
+                await _notify_progress(f"OTP {received_otp} received on {phone} — Verifying OTP...")
                 recaptcha_token_2 = await client.get_dynamic_token(action="submit")
                 payload_step_2 = {
                     "__RequestVerificationToken": dynamic_token,
@@ -1477,12 +1483,12 @@ async def auto_claim_triplet_on_woohoo(
                 if res_2.get("error", True):
                     err_2 = str(res_2.get("messageBody") or res_2)
                     last_error_msg = f"OTP Verification Failed ({phone}): {err_2}"
-                    failed_logs.append(f"❌ `{phone}` — Failed (OTP verification error)")
-                    await _notify_progress(f"Number `{phone}` failed OTP check, switching...")
+                    failed_logs.append(f"❌ {phone} — Failed (OTP verification error)")
+                    await _notify_progress(f"Number {phone} failed OTP check, switching...")
                     continue
 
                 # STEP 3: Final UPI Submission
-                await _notify_progress(f"OTP verified on `{phone}` — Submitting UPI `{upi_id}`...")
+                await _notify_progress(f"OTP verified on {phone} — Submitting UPI {upi_id}...")
                 recaptcha_token_3 = await client.get_dynamic_token(action="submit")
                 payload_step_3 = {
                     "__RequestVerificationToken": dynamic_token,
@@ -1524,14 +1530,15 @@ async def auto_claim_triplet_on_woohoo(
                 else:
                     err_3 = str(res_3.get("messageBody") or res_3)
                     last_error_msg = f"Final UPI Submission Error: {err_3}"
-                    failed_logs.append(f"❌ `{phone}` — Failed (UPI submit error)")
-                    await _notify_progress(f"Number `{phone}` failed at UPI step, switching...")
+                    failed_logs.append(f"❌ {phone} — Failed (UPI submit error)")
+                    await _notify_progress(f"Number {phone} failed at UPI step, switching...")
                     continue
 
             except Exception as e:
                 last_error_msg = str(e)
-                failed_logs.append(f"❌ `{phone}` — Failed ({str(e)[:45]})")
-                await _notify_progress(f"Number `{phone}` encountered an error, switching...")
+                safe_err = _sanitize_plain_log_text(str(e))[:45]
+                failed_logs.append(f"❌ {phone} — Failed ({safe_err})")
+                await _notify_progress(f"Number {phone} encountered an error, switching...")
                 continue
             finally:
                 await client.close()
@@ -2799,23 +2806,14 @@ async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DE
             os.remove(temp_file_path)
 
 
-def _format_auto_claim_progress_text(
-    locked_coupon: str,
-    saved_upi_id: str,
-    status_line: str,
-    failed_logs: list[str],
-) -> str:
-    """Formats the live auto-claim status box with single-line failed number logs below."""
-    base_text = (
-        f"⏳ **Auto-Claim Process Started...**\n"
-        f"🎟️ **Coupon Code :** `{locked_coupon}` *(Locked until claimed)*\n"
-        f"💳 **Reserved UPI:** `{saved_upi_id}` *(Auto-submitted at Step 3)*\n\n"
-        f"🔄 **Live Status:** {status_line}"
-    )
+def _format_live_logs_message(status_line: str, failed_logs: list[str]) -> str:
+    """Formats the separate live status & single-line failed number logs message."""
+    text = f"🔄 Processing: {status_line}"
     if failed_logs:
-        recent_logs = "\n".join(failed_logs[-25:])
-        base_text += f"\n\n📋 **Attempt Logs:**\n{recent_logs}"
-    return base_text
+        text += "\n" + "\n".join(failed_logs[-30:])
+    if len(text) > 3950:
+        text = text[:3940] + "\n..."
+    return text
 
 
 async def send_firebase_assigned_triplet(message_target, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2844,36 +2842,41 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     locked_coupon = coupon_info["coupon"]
     saved_upi_id = upi_cfg["upi_id"]
 
-    initial_progress = _format_auto_claim_progress_text(
-        locked_coupon=locked_coupon,
-        saved_upi_id=saved_upi_id,
-        status_line="In progress — Scanning active online numbers...",
-        failed_logs=[],
-    )
-    wait_msg = await message_target.reply_text(
-        initial_progress,
+    # 1. Start message (kept clean and separate from live log edits)
+    start_msg = await message_target.reply_text(
+        f"⏳ **Auto-Claim Process Started...**\n"
+        f"🎟️ **Coupon Code :** `{locked_coupon}` *(Locked until claimed)*\n"
+        f"💳 **Reserved UPI:** `{saved_upi_id}` *(Auto-submitted at Step 3)*\n\n"
+        "🔄 *Dispatching OTP to active online numbers and verifying via Firebase...*",
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
 
-    last_rendered_text = initial_progress
+    # 2. Separate live logs message where live status & single-line failed number logs get edited
+    initial_live_text = _format_live_logs_message(
+        status_line="Scanning active online numbers...",
+        failed_logs=[],
+    )
+    live_log_msg = await message_target.reply_text(
+        initial_live_text,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+    last_rendered_live_text = initial_live_text
 
     async def _on_claim_progress(status_line: str, failed_logs: list[str]):
-        nonlocal last_rendered_text
-        updated_text = _format_auto_claim_progress_text(
-            locked_coupon=locked_coupon,
-            saved_upi_id=saved_upi_id,
+        nonlocal last_rendered_live_text
+        updated_live_text = _format_live_logs_message(
             status_line=status_line,
             failed_logs=failed_logs,
         )
-        if len(updated_text) > 3900:
-            updated_text = updated_text[:3890] + "\n..."
-        if updated_text != last_rendered_text:
-            last_rendered_text = updated_text
+        if updated_live_text != last_rendered_live_text:
+            last_rendered_live_text = updated_live_text
             try:
-                await wait_msg.edit_text(
-                    updated_text,
-                    parse_mode=ParseMode.MARKDOWN,
+                await live_log_msg.edit_text(
+                    updated_live_text,
+                    parse_mode=None,
                     disable_web_page_preview=True,
                 )
             except Exception:
@@ -2886,23 +2889,12 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         progress_callback=_on_claim_progress,
     )
 
-    failed_logs = claim_result.get("failed_logs", [])
-    failed_logs_block = ""
-    if failed_logs:
-        failed_logs_block = "\n\n📋 **Failed Number Logs:**\n" + "\n".join(failed_logs[-25:])
-
-    try:
-        await wait_msg.delete()
-    except Exception:
-        pass
-
     if not claim_result.get("success"):
         if claim_result.get("reason") != "COUPON_INVALID":
             release_unredeemed_firebase_coupon(context, locked_coupon)
             await message_target.reply_text(
                 f"⚠️ **Auto-Claim Incomplete (Coupon `{locked_coupon}` has been safely preserved):**\n"
-                f"📌 Reason: `{claim_result.get('message')}`"
-                f"{failed_logs_block}\n\n"
+                f"📌 Reason: `{_sanitize_plain_log_text(claim_result.get('message'))}`\n\n"
                 "🔄 Please send new **Active Firebase URLs** or a **`.txt` / `.zip` file** to retry this coupon:",
                 reply_markup=get_cancel_to_claim_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
@@ -2912,8 +2904,7 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         else:
             await message_target.reply_text(
                 f"❌ **Coupon Invalid / Already Used:** `{locked_coupon}`\n"
-                f"📌 {claim_result.get('message')}"
-                f"{failed_logs_block}\n\n"
+                f"📌 {_sanitize_plain_log_text(claim_result.get('message'))}\n\n"
                 "👇 *Tap below to proceed with the next available coupon:*",
                 reply_markup=get_firebase_triplet_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
@@ -2960,8 +2951,8 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         triplet_entry=triplet_entry,
         upi_slot=upi_slot,
         remaining_coupons=coupon_info["remaining_total"],
-        server_message=server_msg,
-    ) + failed_logs_block
+        server_message=_sanitize_plain_log_text(server_msg),
+    )
 
     if upi_slot["needs_new_upi"] or coupon_info["remaining_total"] == 0:
         await message_target.reply_text(
