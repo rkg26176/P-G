@@ -330,7 +330,15 @@ class UnifiedSessionClient:
         if not self.page:
             raise RuntimeError("Session has not been started. Call start() first.")
 
-        await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=20000)
+        for nav_attempt in range(2):
+            try:
+                wait_stage = "domcontentloaded" if nav_attempt == 0 else "commit"
+                await self.page.goto(self.base_url, wait_until=wait_stage, timeout=20000)
+                break
+            except Exception as nav_err:
+                if nav_attempt == 1 or "ERR_ABORTED" not in str(nav_err):
+                    raise nav_err
+                await asyncio.sleep(0.5)
 
         try:
             await self.page.wait_for_selector(
