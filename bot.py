@@ -241,7 +241,7 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def get_shared_browser(headless: bool = True, force_restart: bool = False) -> Browser:
-    """Initializes and reuses a single global Chromium browser instance with crash recovery."""
+    """Initializes and reuses a single global Chromium browser instance."""
     global global_playwright, global_browser
     async with browser_init_lock:
         if force_restart and global_browser:
@@ -259,13 +259,16 @@ async def get_shared_browser(headless: bool = True, force_restart: bool = False)
             global_playwright = await async_playwright().start()
 
         global_browser = await global_playwright.chromium.launch(
-            headless=headless,
+            headless=False,
             args=[
+                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--no-zygote",
+                "--single-process",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--ignore-certificate-errors",
             ],
@@ -290,7 +293,7 @@ class UnifiedSessionClient:
         self.page: Optional[Page] = None
 
     async def start(self):
-        """Initializes a new isolated Context and Page inside the shared Browser, recovering if closed."""
+        """Initializes a new isolated Context and Page inside the shared Browser."""
         is_mobile = self.device_profile.get("is_mobile", False)
         viewport = {"width": 390, "height": 844} if is_mobile else {"width": 1280, "height": 800}
 
@@ -330,15 +333,7 @@ class UnifiedSessionClient:
         if not self.page:
             raise RuntimeError("Session has not been started. Call start() first.")
 
-        for nav_attempt in range(2):
-            try:
-                wait_stage = "domcontentloaded" if nav_attempt == 0 else "commit"
-                await self.page.goto(self.base_url, wait_until=wait_stage, timeout=20000)
-                break
-            except Exception as nav_err:
-                if nav_attempt == 1 or "ERR_ABORTED" not in str(nav_err):
-                    raise nav_err
-                await asyncio.sleep(0.5)
+        await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=20000)
 
         try:
             await self.page.wait_for_selector(
