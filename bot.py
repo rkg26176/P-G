@@ -150,7 +150,7 @@ async def _send_safe_long_text(
     parse_mode: Optional[str] = ParseMode.MARKDOWN,
     disable_web_page_preview: bool = True,
 ) -> None:
-    """Safely sends messages under Telegram's 4096-char limit so Message is too long never occurs[span_5](start_span)[span_5](end_span)."""
+    """Safely sends messages under Telegram's 4096-char limit so Message is too long never occurs."""
     safe_text = str(text or "")
     if len(safe_text) <= 3900:
         try:
@@ -240,27 +240,32 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
     return False
 
 
-async def get_shared_browser(headless: bool = True) -> Browser:
-    """Initializes and reuses a single global Chromium browser instance."""
+async def get_shared_browser(headless: bool = True, force_restart: bool = False) -> Browser:
+    """Initializes and reuses a single global Chromium browser instance with crash recovery."""
     global global_playwright, global_browser
     async with browser_init_lock:
+        if force_restart and global_browser:
+            try:
+                await global_browser.close()
+            except Exception:
+                pass
+            global_browser = None
+
         if global_browser and global_browser.is_connected():
             return global_browser
 
+        global_browser = None
         if not global_playwright:
             global_playwright = await async_playwright().start()
 
         global_browser = await global_playwright.chromium.launch(
-            headless=False,
+            headless=headless,
             args=[
-                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--no-zygote",
-                "--single-process",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--ignore-certificate-errors",
             ],
@@ -285,9 +290,7 @@ class UnifiedSessionClient:
         self.page: Optional[Page] = None
 
     async def start(self):
-        """Initializes a new isolated Context and Page inside the shared Browser."""
-        browser = await get_shared_browser(headless=self.headless)
-
+        """Initializes a new isolated Context and Page inside the shared Browser, recovering if closed."""
         is_mobile = self.device_profile.get("is_mobile", False)
         viewport = {"width": 390, "height": 844} if is_mobile else {"width": 1280, "height": 800}
 
@@ -308,13 +311,19 @@ class UnifiedSessionClient:
                 proxy_dict["password"] = self.proxy_cfg.get("password", "")
             context_kwargs["proxy"] = proxy_dict
 
-        self.context = await browser.new_context(**context_kwargs)
-
-        await self.context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-
-        self.page = await self.context.new_page()
+        for attempt in range(2):
+            browser = await get_shared_browser(headless=self.headless, force_restart=(attempt > 0))
+            try:
+                self.context = await browser.new_context(**context_kwargs)
+                await self.context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                self.page = await self.context.new_page()
+                return
+            except Exception as e:
+                await self.close()
+                if attempt == 1:
+                    raise e
 
     async def load_initial_page(self) -> dict:
         """Loads the main page, sets cookies, and extracts the CSRF token and available state options."""
@@ -1412,7 +1421,6 @@ async def auto_claim_triplet_on_woohoo(
             except Exception:
                 pass
 
-    # Build ordered list: if a working number succeeded earlier, carry it forward up to 8 uses first
     ordered_queue: list[tuple[str, dict]] = []
     pinned_num = _get_pinned_working_number(context)
     if pinned_num:
