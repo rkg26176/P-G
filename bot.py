@@ -1303,6 +1303,37 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
     return chosen
 
 
+def _extract_otp_for_target_number_from_payload(payload_val, target_number: str) -> list[str]:
+    """Searches structured/unstructured Firebase payload for 6-digit OTPs associated with target_number."""
+    matched_otps: list[str] = []
+    num_clean = str(target_number).strip()
+
+    def _scan_node(node):
+        if isinstance(node, dict):
+            node_str = json.dumps(node, ensure_ascii=False)
+            if num_clean and num_clean in node_str:
+                found = extract_numbers_and_otps(node_str).get("otps", [])
+                for o in found:
+                    if len(o) == 6 and o != num_clean[-6:] and o not in matched_otps:
+                        matched_otps.append(o)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    _scan_node(v)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    _scan_node(item)
+                elif isinstance(item, str) and num_clean and num_clean in item:
+                    for o in extract_numbers_and_otps(item).get("otps", []):
+                        if len(o) == 6 and o not in matched_otps:
+                            matched_otps.append(o)
+
+    if isinstance(payload_val, (dict, list)):
+        _scan_node(payload_val)
+
+    return matched_otps
+
+
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
     Polls the single Firebase endpoint every 1 second for up to WAIT_SECONDS (10s)
@@ -1326,6 +1357,10 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
                     if matched and matched.group(1) not in baseline_otps:
                         return matched.group(1)
                 else:
+                    targeted = _extract_otp_for_target_number_from_payload(payload_val, number)
+                    for candidate_otp in targeted:
+                        if len(candidate_otp) == 6 and candidate_otp not in baseline_otps:
+                            return candidate_otp
                     raw_dump = json.dumps(payload_val, ensure_ascii=False)
                     extracted = extract_numbers_and_otps(raw_dump)
                     for candidate_otp in extracted.get("otps", []):
