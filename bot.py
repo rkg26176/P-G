@@ -51,7 +51,7 @@ MAX_CONCURRENT_REQUESTS = 10  # Concurrency limit for checking Firebase URLs
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
-WAIT_SECONDS = 5  # Wait duration in seconds per OTP check cycle
+WAIT_SECONDS = 10  # Wait duration in seconds per OTP check cycle
 
 file_lock = asyncio.Lock()
 active_claim_tasks: dict[int, asyncio.Task] = {}
@@ -1133,7 +1133,7 @@ def trigger_otp_send(number: str, otp_sender_fn: Optional[Callable[[str], bool]]
 
 
 def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
-    """Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a newly arrived 6-digit OTP."""
+    """Polls Firebase every 1 second for up to WAIT_SECONDS (10s) for a newly arrived 6-digit OTP."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
     target = f"{root_url}/numbers/{number_id}/otp.json" + (f"?{query}" if query else "")
     for _ in range(WAIT_SECONDS):
@@ -1169,7 +1169,7 @@ def process_all_panels(
     """
     Iterates through all Active Firebase URLs and their 'online' numbers:
     - Attempts up to MAX_SEND_RETRIES (2) per online number
-    - Clears stale OTP, triggers a fresh OTP, and polls for WAIT_SECONDS (5s)
+    - Clears stale OTP, triggers a fresh OTP, and polls for WAIT_SECONDS (10s)
     - Automatically switches to the next online number or Firebase URL on timeout.
     """
     if used_numbers is None:
@@ -1305,7 +1305,7 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
 
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
-    Polls the single Firebase endpoint every 1 second for up to WAIT_SECONDS (5s)
+    Polls the single Firebase endpoint every 1 second for up to WAIT_SECONDS (10s)
     for a new 6-digit OTP associated with the target number.
     """
     root_url, query = _get_firebase_root_and_query(firebase_url)
@@ -1403,7 +1403,7 @@ async def auto_claim_triplet_on_woohoo(
     1. Reserves the UPI ID for automatic submission in Step 3.
     2. Locks the current coupon code until it is successfully claimed.
     3. Reuses a verified working number up to 8 times (or tries online numbers in Active Firebase Panels
-       with up to 2 retries and 5-second polling per number).
+       with up to 2 retries and 10-second polling per number).
     4. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
     """
     session_panels: dict = context.user_data.get("session_panels", {})
