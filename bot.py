@@ -1328,7 +1328,7 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
                 else:
                     raw_dump = json.dumps(payload_val, ensure_ascii=False)
                     extracted = extract_numbers_and_otps(raw_dump)
-                    for candidate_otp in reversed(extracted.get("otps", [])):
+                    for candidate_otp in extracted.get("otps", []):
                         if len(candidate_otp) == 6 and candidate_otp not in baseline_otps:
                             return candidate_otp
         except Exception:
@@ -1414,6 +1414,7 @@ async def auto_claim_triplet_on_woohoo(
         return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No active Firebase panels found.", "failed_logs": []}
 
     used_numbers: list[str] = context.user_data.setdefault("used_firebase_numbers", [])
+    used_otps_global: list[str] = context.user_data.setdefault("used_firebase_otps", [])
     last_error_msg = "Unable to receive OTP or complete claim on any online number."
     failed_logs: list[str] = []
 
@@ -1513,6 +1514,9 @@ async def auto_claim_triplet_on_woohoo(
                 if num_id:
                     await asyncio.to_thread(clear_old_otp, fb_url, num_id)
                 baseline_otps = await asyncio.to_thread(_get_baseline_otps_sync, fb_url)
+                for prev_otp in used_otps_global:
+                    if prev_otp not in baseline_otps:
+                        baseline_otps.append(prev_otp)
 
                 recaptcha_token = await client.get_dynamic_token(action="submit")
                 payload_step_1 = {
@@ -1558,7 +1562,7 @@ async def auto_claim_triplet_on_woohoo(
                     num_id,
                     baseline_otps,
                 )
-                if received_otp and len(received_otp) == 6 and received_otp.isdigit():
+                if received_otp and len(received_otp) == 6 and received_otp.isdigit() and received_otp not in used_otps_global:
                     break
                 received_otp = None
 
@@ -1608,11 +1612,13 @@ async def auto_claim_triplet_on_woohoo(
                 dynamic_token = res_2["token"]
 
             if res_2.get("error", True):
+                if received_otp not in used_otps_global:
+                    used_otps_global.append(received_otp)
                 if is_pinned_item:
                     context.user_data["pinned_firebase_number"] = None
                 err_2 = str(res_2.get("messageBody") or res_2)
                 last_error_msg = f"OTP Verification Failed ({phone}): {err_2}"
-                failed_logs.append(f"❌ {phone} — Failed (OTP verification error)")
+                failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_2)[:50]})")
                 await _notify_progress(f"Number {phone} failed OTP check, switching...")
                 continue
 
@@ -1645,6 +1651,8 @@ async def auto_claim_triplet_on_woohoo(
 
             res_3 = await safe_post_json(client, API_ENDPOINT, payload_step_3)
             if not res_3.get("error", True):
+                if received_otp not in used_otps_global:
+                    used_otps_global.append(received_otp)
                 success_msg = res_3.get("messageBody") or "Coupon successfully claimed!"
                 pin_info = _pin_or_increment_working_number(context, phone, fb_url, num_id)
                 return {
@@ -1664,7 +1672,7 @@ async def auto_claim_triplet_on_woohoo(
                     context.user_data["pinned_firebase_number"] = None
                 err_3 = str(res_3.get("messageBody") or res_3)
                 last_error_msg = f"Final UPI Submission Error: {err_3}"
-                failed_logs.append(f"❌ {phone} — Failed (UPI submit error)")
+                failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_3)[:50]})")
                 await _notify_progress(f"Number {phone} failed at UPI step, switching...")
                 continue
 
