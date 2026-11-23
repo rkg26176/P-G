@@ -61,6 +61,7 @@ WAITING_FOR_FIREBASE_INPUT = 1
 WAITING_FOR_DIRECT_MOBILE_FLOW = 2
 WAITING_FOR_FIREBASE_COUPONS = 3
 WAITING_FOR_FIREBASE_UPI = 4
+WAITING_FOR_CHECK_COUPONS = 5
 
 # ==========================================
 # WOOHOO DIRECT MOBILE CLAIM CONFIGURATION
@@ -227,8 +228,8 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
     reply_markup = build_join_keyboard(unjoined)
     msg_text = (
         "🚫 **Access Denied**\n\n"
-        "To use this bot, you must join all required channels and the community group listed below.\n"
-        "After joining, click **'✅ Verify Membership'** to continue:"
+        "To use this bot, please join all required channels and the community group listed below.\n"
+        "Once joined, click **'✅ Verify Membership'** to proceed:"
     )
     if update.callback_query:
         try:
@@ -1711,6 +1712,86 @@ async def auto_claim_triplet_on_woohoo(
     }
 
 
+async def check_single_coupon_step1(coupon_code: str) -> tuple[bool, str]:
+    """
+    Checks a single coupon using Step 1 of the Woohoo claim flow with a random
+    10-digit number starting with '9431682' + 3 random digits and an available state.
+    Closes the session immediately once OTP is triggered / Step 1 completes.
+    Returns: (is_valid, status_detail)
+    """
+    random_mobile = f"9431682{random.randint(0, 999):03d}"
+    selected_device = random.choice(DEVICE_PROFILES)
+    proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
+
+    client = UnifiedSessionClient(
+        base_url=BASE_URL,
+        device_profile=selected_device,
+        proxy_cfg=proxy_cfg,
+        headless=True,
+    )
+
+    try:
+        await client.start()
+        page_info = await asyncio.wait_for(client.load_initial_page(), timeout=25.0)
+        dynamic_token = page_info.get("csrf_token", "")
+        scraped_states = page_info.get("states", [])
+
+        if not dynamic_token:
+            return False, "Session token unavailable"
+
+        matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
+        if matching_states:
+            chosen_state = random.choice(matching_states)
+            state_name = chosen_state["name"]
+            state_dropdown_id = chosen_state["id"]
+        elif scraped_states:
+            chosen_state = random.choice(scraped_states)
+            state_name = chosen_state["name"]
+            state_dropdown_id = chosen_state["id"]
+        else:
+            state_name = random.choice(STATES_LIST)
+            state_dropdown_id = "1"
+
+        recaptcha_token = await client.get_dynamic_token(action="submit")
+        payload_step_1 = {
+            "__RequestVerificationToken": dynamic_token,
+            "token": recaptcha_token,
+            "curPage": "1",
+            "maxPage": "3",
+            "stateDropdown": state_dropdown_id,
+            "cityDropdown": "0",
+            "branchDropdown": "0",
+            "retailerDropdown": "0",
+            "talukanameDropdown": "0",
+            "parametersOccurance": "0",
+            "CALLPANNAMEMATCH": "0",
+            "MOBILE": random_mobile,
+            "COUPONCODE": coupon_code,
+            "STATE": state_name,
+            "CHECKBOX1": "on",
+            "OTP": "",
+            "REDEMPTIONTYPE": "",
+            "ChoiceAnswer": "",
+        }
+
+        res_1 = await safe_post_json(client, API_ENDPOINT, payload_step_1)
+        msg_body = str(res_1.get("messageBody") or "").strip()
+
+        if not res_1.get("error", True):
+            return True, msg_body or "OTP dispatched"
+
+        err_lower = (msg_body or str(res_1)).lower()
+        if any(k in err_lower for k in ("invalid", "already used", "already claimed", "expired", "not valid", "incorrect")):
+            return False, msg_body or "Invalid coupon"
+
+        return False, msg_body or "Rejected"
+
+    except Exception as e:
+        return False, _sanitize_plain_log_text(str(e))[:80]
+    finally:
+        await client.close()
+
+
 def pick_unused_firebase_coupon(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
     """Selects one unused coupon from the user's queue and marks it as used."""
     all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
@@ -2126,6 +2207,18 @@ def get_cancel_to_claim_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_keep_existing_upi_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "❌ Cancel (Keep Existing UPI)",
+                callback_data="fb_keep_existing_upi",
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def get_firebase_triplet_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [
@@ -2177,6 +2270,14 @@ PASTE_URL_PROMPT_TEXT = (
     "👇 *Send your links or file below, or tap Cancel to go back:*"
 )
 
+CHECK_COUPON_PROMPT_TEXT = (
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🔍 **Coupon Status Checker**\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Please send your **Single Coupon**, **Bulk Coupons** (space, comma, or line-separated), or upload a **`.txt` file**.\n\n"
+    "👇 *Send your coupon codes or `.txt` file below, or tap Cancel:*"
+)
+
 COUPON_PROMPT_AFTER_ACTIVE_TEXT = (
     "🎟️ **Active Firebase Panel Verified! Now Send Your Coupon Codes:**\n\n"
     "• You can send a **Single Coupon**, **Multiple Coupons** (space, comma, or line-separated), or upload a **`.txt` file**.\n\n"
@@ -2191,6 +2292,20 @@ def build_fresh_upi_prompt_text(coupon_count: int) -> str:
         f"⚠️ *This UPI ID will remain locked for **{MAX_FIREBASE_UPI_USES} consecutive claims**. Once all {MAX_FIREBASE_UPI_USES} uses are completed, you will be prompted for a new UPI ID (duplicate UPI IDs are not permitted).*\n\n"
         "👇 *Enter your fresh UPI ID below or tap Cancel:*"
     )
+
+
+def build_existing_upi_change_prompt_text(upi_cfg: dict) -> str:
+    current_upi = upi_cfg.get("upi_id", "")
+    used_count = upi_cfg.get("used_count", 0)
+    max_uses = upi_cfg.get("max_uses", MAX_FIREBASE_UPI_USES)
+    remaining_uses = upi_cfg.get("remaining_uses", max_uses)
+    return (
+        "⚠️ **Active UPI ID Already Assigned**\n\n"
+        f"Your previous UPI ID `{current_upi}` has not completed all `{max_uses}` uses yet "
+        f"*(`{used_count}/{max_uses}` used, `{remaining_uses}` remaining)*.\n\n"
+        "Would you like to change this UPI ID?\n"
+        "• Send a **new UPI ID** directly below to replace it, or tap **Cancel** to keep using `{current_upi}` and resume automatically."
+    ).replace("{current_upi}", current_upi)
 
 
 NEXT_NEW_UPI_PROMPT_TEXT = (
@@ -2224,6 +2339,46 @@ def build_atoz_claim_log_text(
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 **Remaining Unused Coupons:** `{remaining_coupons}` | **UPI Uses Left:** `{upi_slot['remaining_uses']}`"
     )
+
+
+def _has_preserved_coupons(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
+    used_coupons: list[str] = context.user_data.get("used_firebase_coupons", [])
+    return any(c not in used_coupons for c in all_coupons)
+
+
+def _has_active_upi_with_slots(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    upi_cfg = context.user_data.get("firebase_upi_config")
+    return bool(upi_cfg and not upi_cfg.get("completed", False) and upi_cfg.get("remaining_uses", 0) > 0)
+
+
+async def _resume_or_prompt_after_active_panel(message_target, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Resumes saved coupon queue / active UPI automatically if available, otherwise prompts."""
+    if _has_preserved_coupons(context):
+        if _has_active_upi_with_slots(context):
+            return await send_firebase_assigned_triplet(message_target, context)
+        upi_cfg = context.user_data.get("firebase_upi_config")
+        if upi_cfg and upi_cfg.get("remaining_uses", 0) > 0:
+            await message_target.reply_text(
+                build_existing_upi_change_prompt_text(upi_cfg),
+                reply_markup=get_keep_existing_upi_keyboard(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return WAITING_FOR_FIREBASE_UPI
+        coupon_count = len(context.user_data.get("firebase_coupons", []))
+        await message_target.reply_text(
+            build_fresh_upi_prompt_text(coupon_count),
+            reply_markup=get_cancel_to_claim_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return WAITING_FOR_FIREBASE_UPI
+
+    await message_target.reply_text(
+        COUPON_PROMPT_AFTER_ACTIVE_TEXT,
+        reply_markup=get_cancel_to_claim_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAITING_FOR_FIREBASE_COUPONS
 
 
 # ==========================================
@@ -2335,17 +2490,154 @@ async def handle_claim_coupon_menu(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+async def handle_check_coupon_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_user_subscribed(update, context):
+        return ConversationHandler.END
+
+    context.user_data["telegram_user_info"] = _extract_telegram_user_info(update)
+
+    await update.message.reply_text(
+        CHECK_COUPON_PROMPT_TEXT,
+        reply_markup=get_cancel_to_claim_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAITING_FOR_CHECK_COUPONS
+
+
+async def _run_coupon_check_batch(message_target, coupons: list[str]) -> None:
+    """Checks each coupon one by one using Step 1, closes session after OTP trigger, and sends results."""
+    total = len(coupons)
+    status_msg = await message_target.reply_text(
+        f"⏳ Checking coupons (0/{total})...",
+        parse_mode=None,
+    )
+
+    valid_coupons: list[str] = []
+    invalid_lines: list[str] = []
+
+    for idx, code in enumerate(coupons, 1):
+        try:
+            await status_msg.edit_text(
+                f"🔄 Checking coupon {idx}/{total}: {code}",
+                parse_mode=None,
+            )
+        except Exception:
+            pass
+
+        is_valid, detail = await check_single_coupon_step1(code)
+        if is_valid:
+            valid_coupons.append(code)
+        else:
+            invalid_lines.append(f"❌ {code} — {detail}")
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    if valid_coupons:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as tmp:
+            tmp.write("\n".join(valid_coupons) + "\n")
+            valid_txt_path = tmp.name
+
+        try:
+            with open(valid_txt_path, "rb") as f:
+                await message_target.reply_document(
+                    document=f,
+                    filename="valid_coupons.txt",
+                    caption=f"✅ Valid Coupons ({len(valid_coupons)})",
+                )
+        finally:
+            if os.path.exists(valid_txt_path):
+                os.remove(valid_txt_path)
+    else:
+        await message_target.reply_text("ℹ️ No valid coupons found.", parse_mode=None)
+
+    if invalid_lines:
+        await _send_safe_long_text(
+            message_target,
+            "❌ Invalid Coupons:\n" + "\n".join(invalid_lines),
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+
+
+async def receive_check_coupons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_text = update.message.text.strip()
+
+    if user_text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
+        if user_text == "Claim Coupon":
+            await handle_claim_coupon_menu(update, context)
+            return ConversationHandler.END
+        elif user_text == "Check Coupon":
+            return await handle_check_coupon_menu(update, context)
+        else:
+            await handle_other_main_buttons(update, context)
+            return ConversationHandler.END
+
+    if not await ensure_user_subscribed(update, context):
+        return ConversationHandler.END
+
+    coupons = extract_coupon_codes_from_text(user_text)
+    if not coupons:
+        await update.message.reply_text(
+            "❌ No valid coupon codes found. Please send single/bulk coupons or upload a .txt file:",
+            reply_markup=get_cancel_to_claim_keyboard(),
+            parse_mode=None,
+        )
+        return WAITING_FOR_CHECK_COUPONS
+
+    await _run_coupon_check_batch(update.message, coupons)
+    return ConversationHandler.END
+
+
+async def receive_check_coupons_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_user_subscribed(update, context):
+        return ConversationHandler.END
+
+    document = update.message.document
+    file_name = (document.file_name or "").lower() if document else ""
+
+    if not document or not file_name.endswith(".txt"):
+        await update.message.reply_text(
+            "⚠️ Please upload a .txt file containing coupon codes or send them directly:",
+            reply_markup=get_cancel_to_claim_keyboard(),
+            parse_mode=None,
+        )
+        return WAITING_FOR_CHECK_COUPONS
+
+    temp_file_path = None
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+            temp_file_path = tmp.name
+
+        await tg_file.download_to_drive(temp_file_path)
+        extracted_text = await asyncio.to_thread(read_text_from_txt, temp_file_path)
+
+        coupons = extract_coupon_codes_from_text(extracted_text)
+        if not coupons:
+            await update.message.reply_text(
+                "❌ No valid coupon codes found in the .txt file. Please upload a valid .txt file:",
+                reply_markup=get_cancel_to_claim_keyboard(),
+                parse_mode=None,
+            )
+            return WAITING_FOR_CHECK_COUPONS
+
+        await _run_coupon_check_batch(update.message, coupons)
+        return ConversationHandler.END
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
 async def handle_other_main_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_user_subscribed(update, context):
         return
 
     text = update.message.text
     if text == "Check Coupon":
-        await update.message.reply_text(
-            "🚫 **Check Coupon — Temporarily Unavailable**\n\n"
-            "This feature is currently disabled for maintenance.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await handle_check_coupon_menu(update, context)
     elif text == "Buy Coupon":
         await update.message.reply_text(
             "🛒 **Buy Coupon**\nThis feature will be configured shortly.",
@@ -2435,6 +2727,19 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
             )
             return WAITING_FOR_DIRECT_MOBILE_FLOW
 
+    elif data == "fb_keep_existing_upi":
+        upi_cfg = context.user_data.get("firebase_upi_config")
+        if upi_cfg and upi_cfg.get("remaining_uses", 0) > 0:
+            try:
+                await query.edit_message_text(
+                    f"✅ Keeping existing UPI ID `{upi_cfg['upi_id']}` and resuming auto-claim...",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            return await send_firebase_assigned_triplet(query.message, context)
+        return await send_firebase_assigned_triplet(query.message, context)
+
     elif data == "fb_next_triplet":
         triplets = context.user_data.get("firebase_assigned_triplets", [])
         if triplets:
@@ -2496,9 +2801,12 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
         await close_user_session(update.effective_chat.id)
         if text == "Claim Coupon":
             await handle_claim_coupon_menu(update, context)
+            return ConversationHandler.END
+        elif text == "Check Coupon":
+            return await handle_check_coupon_menu(update, context)
         else:
             await handle_other_main_buttons(update, context)
-        return ConversationHandler.END
+            return ConversationHandler.END
 
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
@@ -2818,9 +3126,12 @@ async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFA
     if user_text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
         if user_text == "Claim Coupon":
             await handle_claim_coupon_menu(update, context)
+            return ConversationHandler.END
+        elif user_text == "Check Coupon":
+            return await handle_check_coupon_menu(update, context)
         else:
             await handle_other_main_buttons(update, context)
-        return ConversationHandler.END
+            return ConversationHandler.END
 
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
@@ -2845,12 +3156,7 @@ async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFA
         )
 
     if has_active:
-        await update.message.reply_text(
-            COUPON_PROMPT_AFTER_ACTIVE_TEXT,
-            reply_markup=get_cancel_to_claim_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return WAITING_FOR_FIREBASE_COUPONS
+        return await _resume_or_prompt_after_active_panel(update.message, context)
 
     await update.message.reply_text(
         "⚠️ **No Active Firebase Panel Found.**\n"
@@ -2938,12 +3244,7 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
             )
 
         if has_active:
-            await update.message.reply_text(
-                COUPON_PROMPT_AFTER_ACTIVE_TEXT,
-                reply_markup=get_cancel_to_claim_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return WAITING_FOR_FIREBASE_COUPONS
+            return await _resume_or_prompt_after_active_panel(update.message, context)
 
         await update.message.reply_text(
             "⚠️ **No Active Firebase Panel Found.**\n"
@@ -2980,9 +3281,12 @@ async def receive_firebase_coupons_text(update: Update, context: ContextTypes.DE
     if user_text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
         if user_text == "Claim Coupon":
             await handle_claim_coupon_menu(update, context)
+            return ConversationHandler.END
+        elif user_text == "Check Coupon":
+            return await handle_check_coupon_menu(update, context)
         else:
             await handle_other_main_buttons(update, context)
-        return ConversationHandler.END
+            return ConversationHandler.END
 
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
@@ -3001,6 +3305,15 @@ async def receive_firebase_coupons_text(update: Update, context: ContextTypes.DE
 
     context.user_data["firebase_coupons"] = coupons
     context.user_data.setdefault("used_firebase_coupons", [])
+
+    existing_upi_cfg = context.user_data.get("firebase_upi_config")
+    if existing_upi_cfg and not existing_upi_cfg.get("completed", False) and existing_upi_cfg.get("remaining_uses", 0) > 0:
+        await update.message.reply_text(
+            build_existing_upi_change_prompt_text(existing_upi_cfg),
+            reply_markup=get_keep_existing_upi_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return WAITING_FOR_FIREBASE_UPI
 
     await update.message.reply_text(
         build_fresh_upi_prompt_text(len(coupons)),
@@ -3048,6 +3361,15 @@ async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DE
 
         context.user_data["firebase_coupons"] = coupons
         context.user_data.setdefault("used_firebase_coupons", [])
+
+        existing_upi_cfg = context.user_data.get("firebase_upi_config")
+        if existing_upi_cfg and not existing_upi_cfg.get("completed", False) and existing_upi_cfg.get("remaining_uses", 0) > 0:
+            await update.message.reply_text(
+                build_existing_upi_change_prompt_text(existing_upi_cfg),
+                reply_markup=get_keep_existing_upi_keyboard(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return WAITING_FOR_FIREBASE_UPI
 
         await update.message.reply_text(
             build_fresh_upi_prompt_text(len(coupons)),
@@ -3270,9 +3592,12 @@ async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAU
     if upi_text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
         if upi_text == "Claim Coupon":
             await handle_claim_coupon_menu(update, context)
+            return ConversationHandler.END
+        elif user_text == "Check Coupon":
+            return await handle_check_coupon_menu(update, context)
         else:
             await handle_other_main_buttons(update, context)
-        return ConversationHandler.END
+            return ConversationHandler.END
 
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
@@ -3376,11 +3701,19 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_firebase_fresh_upi),
                 CallbackQueryHandler(
                     claim_inline_callback_handler,
-                    pattern="^(fb_next_triplet|fb_retry_coupon|back_to_claim_menu)$",
+                    pattern="^(fb_keep_existing_upi|fb_next_triplet|fb_retry_coupon|back_to_claim_menu)$",
                 ),
             ],
             WAITING_FOR_DIRECT_MOBILE_FLOW: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_direct_mobile_flow_input),
+                CallbackQueryHandler(
+                    claim_inline_callback_handler,
+                    pattern="^back_to_claim_menu$",
+                ),
+            ],
+            WAITING_FOR_CHECK_COUPONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_check_coupons_text),
+                MessageHandler(filters.Document.ALL, receive_check_coupons_file),
                 CallbackQueryHandler(
                     claim_inline_callback_handler,
                     pattern="^back_to_claim_menu$",
@@ -3403,9 +3736,10 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
     app.add_handler(MessageHandler(filters.Regex("^Claim Coupon$"), handle_claim_coupon_menu))
+    app.add_handler(MessageHandler(filters.Regex("^Check Coupon$"), handle_check_coupon_menu))
     app.add_handler(
         MessageHandler(
-            filters.Regex("^(Check Coupon|Buy Coupon|Support|🏆 Leaderboard)$"),
+            filters.Regex("^(Buy Coupon|Support|🏆 Leaderboard)$"),
             handle_other_main_buttons,
         )
     )
