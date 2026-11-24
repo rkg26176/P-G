@@ -14,6 +14,7 @@ from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
+from requests.adapters import HTTPAdapter
 from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
 from telegram import (
     Update,
@@ -700,6 +701,20 @@ async def init_user_session(chat_id: int) -> bool:
 # ==========================================
 # 3. FIREBASE STATUS CHECKER (SINGLE CHECK)
 # ==========================================
+_fb_http_session: Optional[requests.Session] = None
+
+
+def _get_fb_http_session() -> requests.Session:
+    global _fb_http_session
+    if _fb_http_session is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _fb_http_session = sess
+    return _fb_http_session
+
+
 def _build_firebase_query_url(firebase_url: str, node_suffix: str = "") -> str:
     """
     Safely constructs a valid Firebase REST API URL (.json) while preserving
@@ -814,9 +829,10 @@ def check_firebase_sms_status(firebase_url: str) -> str:
     target_url = _build_firebase_query_url(firebase_url, "")
     all_timestamps: list[float] = []
     state_flags = {"has_online_node": False}
+    sess = _get_fb_http_session()
 
     try:
-        response = requests.get(target_url, timeout=8)
+        response = sess.get(target_url, timeout=(3.0, 4.0))
         response.raise_for_status()
         data = response.json()
 
