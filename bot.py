@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import string
 import tempfile
 import time
 import zipfile
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
 MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
-MAX_CONCURRENT_REQUESTS = 25  # Balanced concurrency limit for checking Firebase URLs
+MAX_CONCURRENT_REQUESTS = 50  # High concurrency limit for fast bulk Firebase URL checking
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
@@ -1787,8 +1788,13 @@ def _mark_panel_status_in_session(context: ContextTypes.DEFAULT_TYPE, fb_url: st
         info["checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _generate_random_suffix(length: int = 3) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
 async def _send_active_panels_txt_file(message_target, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Creates and sends a .txt file (GBX_PANNEL.txt) containing verified active Firebase panel URLs."""
+    """Creates and sends a .txt file (Gbx_Active_fb_<rand>.txt) containing verified active Firebase panel URLs."""
     session_panels: dict = context.user_data.get("session_panels", {})
     active_urls = [
         ep for ep, info in session_panels.items()
@@ -1798,6 +1804,8 @@ async def _send_active_panels_txt_file(message_target, context: ContextTypes.DEF
         return
 
     unique_active_urls = list(dict.fromkeys(active_urls))
+    rand_tag = _generate_random_suffix(3)
+    out_filename = f"Gbx_Active_fb_{rand_tag}.txt"
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as tmp:
@@ -1807,11 +1815,11 @@ async def _send_active_panels_txt_file(message_target, context: ContextTypes.DEF
         with open(tmp_path, "rb") as f:
             await message_target.reply_document(
                 document=f,
-                filename="GBX_PANNEL.txt",
-                caption=f"📄 GBX PANNEL — Active Panels ({len(unique_active_urls)})",
+                filename=out_filename,
+                caption=f"📄 Gbx Active FB — Active Panels ({len(unique_active_urls)})",
             )
     except Exception as e:
-        logger.warning(f"Failed to send GBX_PANNEL.txt: {e}")
+        logger.warning(f"Failed to send {out_filename}: {e}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -1824,12 +1832,12 @@ async def auto_claim_triplet_on_woohoo(
     progress_callback: Optional[Callable[[str, list[str]], Awaitable[None]]] = None,
 ) -> dict:
     """
-    Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet
-    panel-by-panel in order:
-    1. Checks saved Firebase panels in order and fetches online numbers.
-    2. Dispatches OTP to an online number and polls/fetches OTP; if none arrives, checks the next online number in that panel.
-    3. Once all numbers in the current panel are exhausted, switches to the next saved Firebase panel in order.
-    4. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
+    Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet:
+    1. Creates the session first and logs live session/error status.
+    2. Checks saved Firebase panels in order and fetches online numbers.
+    3. Dispatches OTP to an online number and polls/fetches OTP; if none arrives, checks the next online number in that panel.
+    4. Once all numbers in the current panel are exhausted, switches to the next saved Firebase panel in order.
+    5. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
     """
     ordered_endpoints = _get_ordered_saved_firebase_endpoints(context)
     if not ordered_endpoints:
@@ -1846,6 +1854,48 @@ async def auto_claim_triplet_on_woohoo(
                 await progress_callback(_sanitize_plain_log_text(status_line), list(failed_logs))
             except Exception:
                 pass
+
+    # Create session first before checking panels/numbers
+    await _notify_progress("Session creating...")
+    selected_device = random.choice(DEVICE_PROFILES)
+    proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
+    client = UnifiedSessionClient(
+        base_url=BASE_URL,
+        device_profile=selected_device,
+        proxy_cfg=proxy_cfg,
+        headless=True,
+    )
+
+    dynamic_token = ""
+    scraped_states = []
+    state_name = random.choice(STATES_LIST)
+    state_dropdown_id = "1"
+
+    try:
+        await client.start()
+        page_info = await asyncio.wait_for(client.load_initial_page(), timeout=25.0)
+        dynamic_token = page_info.get("csrf_token", "")
+        scraped_states = page_info.get("states", [])
+
+        if not dynamic_token:
+            failed_logs.append("⚠️ Session Error — Initial session token not found, retrying session...")
+            await _notify_progress("Session error: token missing, retrying session...")
+        else:
+            matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
+            if matching_states:
+                chosen_state = random.choice(matching_states)
+                state_name = chosen_state["name"]
+                state_dropdown_id = chosen_state["id"]
+            elif scraped_states:
+                chosen_state = random.choice(scraped_states)
+                state_name = chosen_state["name"]
+                state_dropdown_id = chosen_state["id"]
+            failed_logs.append("✅ Session created successfully.")
+            await _notify_progress("Session created — Scanning panels and online numbers...")
+    except Exception as e:
+        safe_init_err = _sanitize_plain_log_text(str(e))[:65]
+        failed_logs.append(f"⚠️ Session Error — {safe_init_err}")
+        await _notify_progress(f"Session error: {safe_init_err}")
 
     ordered_queue: list[tuple[str, dict]] = []
     pinned_num = _get_pinned_working_number(context)
@@ -1874,6 +1924,7 @@ async def auto_claim_triplet_on_woohoo(
             if not has_recent:
                 _mark_panel_status_in_session(context, fb_url, False, "No online numbers / recent SMS")
             failed_logs.append(f"⚠️ Panel {panel_idx} — No online numbers, switching to next panel...")
+            await _notify_progress(f"Panel {panel_idx} — No online numbers, switching to next panel...")
             continue
 
         _mark_panel_status_in_session(context, fb_url, True, f"{len(candidates)} online numbers")
@@ -1893,74 +1944,152 @@ async def auto_claim_triplet_on_woohoo(
                 ordered_queue.append((fb_url, c))
 
     if not ordered_queue:
+        await client.close()
         return {"success": False, "reason": "ALL_NUMBERS_EXHAUSTED", "message": last_error_msg, "failed_logs": failed_logs}
 
-    for fb_url, item in ordered_queue:
-        phone = item["number"]
-        num_id = item["id"]
-        is_pinned_item = bool(item.get("is_pinned"))
+    try:
+        for fb_url, item in ordered_queue:
+            phone = item["number"]
+            num_id = item["id"]
+            is_pinned_item = bool(item.get("is_pinned"))
 
-        if not is_pinned_item:
-            _record_used_item_bounded(used_numbers, phone)
+            if not is_pinned_item:
+                _record_used_item_bounded(used_numbers, phone)
 
-        await _notify_progress(f"Initializing session for {phone}...")
+            await _notify_progress(f"Using session for {phone}...")
 
-        selected_device = random.choice(DEVICE_PROFILES)
-        proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
-        client = UnifiedSessionClient(
-            base_url=BASE_URL,
-            device_profile=selected_device,
-            proxy_cfg=proxy_cfg,
-            headless=True,
-        )
+            try:
+                if not client.page or client.page.is_closed() or not dynamic_token:
+                    await client.close()
+                    selected_device = random.choice(DEVICE_PROFILES)
+                    proxy_cfg = random.choice(PROXIES_CONFIG) if PROXIES_CONFIG else None
+                    client = UnifiedSessionClient(
+                        base_url=BASE_URL,
+                        device_profile=selected_device,
+                        proxy_cfg=proxy_cfg,
+                        headless=True,
+                    )
+                    await client.start()
+                    page_info = await asyncio.wait_for(client.load_initial_page(), timeout=25.0)
+                    dynamic_token = page_info.get("csrf_token", "")
+                    scraped_states = page_info.get("states", [])
+                    if dynamic_token:
+                        matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
+                        if matching_states:
+                            chosen_state = random.choice(matching_states)
+                            state_name = chosen_state["name"]
+                            state_dropdown_id = chosen_state["id"]
+                        elif scraped_states:
+                            chosen_state = random.choice(scraped_states)
+                            state_name = chosen_state["name"]
+                            state_dropdown_id = chosen_state["id"]
+                        else:
+                            state_name = random.choice(STATES_LIST)
+                            state_dropdown_id = "1"
+                    else:
+                        last_error_msg = "Failed to fetch initial session token from the website."
+                        if is_pinned_item:
+                            context.user_data["pinned_firebase_number"] = None
+                        failed_logs.append(f"❌ {phone} — Session error (Token unavailable)")
+                        await _notify_progress(f"Session error for {phone}, switching...")
+                        continue
 
-        try:
-            await client.start()
-            page_info = await asyncio.wait_for(client.load_initial_page(), timeout=25.0)
-            dynamic_token = page_info.get("csrf_token", "")
-            scraped_states = page_info.get("states", [])
+                received_otp = None
+                coupon_invalid = False
+                step1_error_reason = ""
 
-            if not dynamic_token:
-                last_error_msg = "Failed to fetch initial session token from the website."
-                if is_pinned_item:
-                    context.user_data["pinned_firebase_number"] = None
-                failed_logs.append(f"❌ {phone} — Failed (Session token error)")
-                await _notify_progress(f"Session failed for {phone}, switching...")
-                continue
+                for attempt in range(1, MAX_SEND_RETRIES + 1):
+                    await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Sending OTP)...")
 
-            matching_states = [s for s in scraped_states if s["name"] in STATES_LIST]
-            if matching_states:
-                chosen_state = random.choice(matching_states)
-                state_name = chosen_state["name"]
-                state_dropdown_id = chosen_state["id"]
-            elif scraped_states:
-                chosen_state = random.choice(scraped_states)
-                state_name = chosen_state["name"]
-                state_dropdown_id = chosen_state["id"]
-            else:
-                state_name = random.choice(STATES_LIST)
-                state_dropdown_id = "1"
+                    if num_id:
+                        await asyncio.to_thread(clear_old_otp, fb_url, num_id)
+                    baseline_otps = await asyncio.to_thread(_get_baseline_otps_sync, fb_url)
+                    for prev_otp in used_otps_global:
+                        if prev_otp not in baseline_otps:
+                            baseline_otps.append(prev_otp)
 
-            received_otp = None
-            coupon_invalid = False
-            step1_error_reason = ""
+                    trigger_ms = int(time.time() * 1000)
+                    recaptcha_token = await client.get_dynamic_token(action="submit")
+                    payload_step_1 = {
+                        "__RequestVerificationToken": dynamic_token,
+                        "token": recaptcha_token,
+                        "curPage": "1",
+                        "maxPage": "3",
+                        "stateDropdown": state_dropdown_id,
+                        "cityDropdown": "0",
+                        "branchDropdown": "0",
+                        "retailerDropdown": "0",
+                        "talukanameDropdown": "0",
+                        "parametersOccurance": "0",
+                        "CALLPANNAMEMATCH": "0",
+                        "MOBILE": phone,
+                        "COUPONCODE": coupon_code,
+                        "STATE": state_name,
+                        "CHECKBOX1": "on",
+                        "OTP": "",
+                        "REDEMPTIONTYPE": "",
+                        "ChoiceAnswer": "",
+                    }
 
-            for attempt in range(1, MAX_SEND_RETRIES + 1):
-                await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Sending OTP)...")
+                    res_1 = await safe_post_json(client, API_ENDPOINT, payload_step_1)
+                    if res_1.get("token"):
+                        dynamic_token = res_1["token"]
 
-                if num_id:
-                    await asyncio.to_thread(clear_old_otp, fb_url, num_id)
-                baseline_otps = await asyncio.to_thread(_get_baseline_otps_sync, fb_url)
-                for prev_otp in used_otps_global:
-                    if prev_otp not in baseline_otps:
-                        baseline_otps.append(prev_otp)
+                    if res_1.get("error", True):
+                        err_body = str(res_1.get("messageBody") or res_1)
+                        last_error_msg = err_body
+                        step1_error_reason = _sanitize_plain_log_text(err_body)[:60]
+                        failed_logs.append(f"⚠️ {phone} — Step 1 error: {step1_error_reason}")
+                        if any(k in err_body.lower() for k in ("invalid coupon", "already used", "already claimed", "expired", "not valid")):
+                            coupon_invalid = True
+                            break
+                        continue
 
-                trigger_ms = int(time.time() * 1000)
-                recaptcha_token = await client.get_dynamic_token(action="submit")
-                payload_step_1 = {
+                    await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Waiting {WAIT_SECONDS}s for OTP)...")
+
+                    received_otp = await fetch_otp_from_firebase(
+                        fb_url=fb_url,
+                        client_id=str(num_id or ""),
+                        trigger_ms=trigger_ms,
+                        timeout=SMS_WAIT_TIMEOUT,
+                        exclude=set(baseline_otps),
+                    )
+                    if not received_otp:
+                        received_otp = await asyncio.to_thread(
+                            _poll_otp_for_number_sync,
+                            fb_url,
+                            phone,
+                            num_id,
+                            baseline_otps,
+                        )
+                    if received_otp and len(received_otp) == 6 and received_otp.isdigit() and received_otp not in used_otps_global:
+                        break
+                    received_otp = None
+
+                if coupon_invalid:
+                    return {
+                        "success": False,
+                        "reason": "COUPON_INVALID",
+                        "message": f"Coupon `{coupon_code}` Error: {last_error_msg}",
+                        "failed_logs": failed_logs,
+                    }
+
+                if not received_otp:
+                    if is_pinned_item:
+                        context.user_data["pinned_firebase_number"] = None
+                    reason_short = step1_error_reason if step1_error_reason else f"No OTP after {MAX_SEND_RETRIES} attempts"
+                    last_error_msg = f"No OTP received on {phone} after {MAX_SEND_RETRIES} attempts."
+                    failed_logs.append(f"❌ {phone} — Failed ({reason_short})")
+                    await _notify_progress(f"Number {phone} failed, switching to next...")
+                    continue
+
+                # STEP 2: OTP Verification
+                await _notify_progress(f"OTP {received_otp} received on {phone} — Verifying OTP...")
+                recaptcha_token_2 = await client.get_dynamic_token(action="submit")
+                payload_step_2 = {
                     "__RequestVerificationToken": dynamic_token,
-                    "token": recaptcha_token,
-                    "curPage": "1",
+                    "token": recaptcha_token_2,
+                    "curPage": "2",
                     "maxPage": "3",
                     "stateDropdown": state_dropdown_id,
                     "cityDropdown": "0",
@@ -1973,164 +2102,89 @@ async def auto_claim_triplet_on_woohoo(
                     "COUPONCODE": coupon_code,
                     "STATE": state_name,
                     "CHECKBOX1": "on",
-                    "OTP": "",
+                    "OTP": received_otp,
                     "REDEMPTIONTYPE": "",
                     "ChoiceAnswer": "",
                 }
 
-                res_1 = await safe_post_json(client, API_ENDPOINT, payload_step_1)
-                if res_1.get("token"):
-                    dynamic_token = res_1["token"]
+                res_2 = await safe_post_json(client, API_ENDPOINT, payload_step_2)
+                if res_2.get("token"):
+                    dynamic_token = res_2["token"]
 
-                if res_1.get("error", True):
-                    err_body = str(res_1.get("messageBody") or res_1)
-                    last_error_msg = err_body
-                    step1_error_reason = _sanitize_plain_log_text(err_body)[:60]
-                    if any(k in err_body.lower() for k in ("invalid coupon", "already used", "already claimed", "expired", "not valid")):
-                        coupon_invalid = True
-                        break
+                if res_2.get("error", True):
+                    _record_used_item_bounded(used_otps_global, received_otp)
+                    if is_pinned_item:
+                        context.user_data["pinned_firebase_number"] = None
+                    err_2 = str(res_2.get("messageBody") or res_2)
+                    last_error_msg = f"OTP Verification Failed ({phone}): {err_2}"
+                    failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_2)[:50]})")
+                    await _notify_progress(f"Number {phone} failed OTP check, switching...")
                     continue
 
-                await _notify_progress(f"Trying {phone} (Attempt {attempt}/{MAX_SEND_RETRIES} — Waiting {WAIT_SECONDS}s for OTP)...")
-
-                received_otp = await fetch_otp_from_firebase(
-                    fb_url=fb_url,
-                    client_id=str(num_id or ""),
-                    trigger_ms=trigger_ms,
-                    timeout=SMS_WAIT_TIMEOUT,
-                    exclude=set(baseline_otps),
-                )
-                if not received_otp:
-                    received_otp = await asyncio.to_thread(
-                        _poll_otp_for_number_sync,
-                        fb_url,
-                        phone,
-                        num_id,
-                        baseline_otps,
-                    )
-                if received_otp and len(received_otp) == 6 and received_otp.isdigit() and received_otp not in used_otps_global:
-                    break
-                received_otp = None
-
-            if coupon_invalid:
-                return {
-                    "success": False,
-                    "reason": "COUPON_INVALID",
-                    "message": f"Coupon `{coupon_code}` Error: {last_error_msg}",
-                    "failed_logs": failed_logs,
+                # STEP 3: Final UPI Submission
+                await _notify_progress(f"OTP verified on {phone} — Submitting UPI {upi_id}...")
+                recaptcha_token_3 = await client.get_dynamic_token(action="submit")
+                payload_step_3 = {
+                    "__RequestVerificationToken": dynamic_token,
+                    "token": recaptcha_token_3,
+                    "curPage": "3",
+                    "maxPage": "3",
+                    "stateDropdown": state_dropdown_id,
+                    "cityDropdown": "0",
+                    "branchDropdown": "0",
+                    "retailerDropdown": "0",
+                    "talukanameDropdown": "0",
+                    "parametersOccurance": "0",
+                    "CALLPANNAMEMATCH": "0",
+                    "MOBILE": phone,
+                    "COUPONCODE": coupon_code,
+                    "STATE": state_name,
+                    "CHECKBOX1": "on",
+                    "OTP": received_otp,
+                    "REDEMPTIONTYPERADIO": "on",
+                    "REDEMPTIONTYPE": "10117",
+                    "UPIID": upi_id,
+                    "CHECKBOX2": "on",
+                    "ChoiceAnswer": "10117_on",
                 }
 
-            if not received_otp:
+                res_3 = await safe_post_json(client, API_ENDPOINT, payload_step_3)
+                if not res_3.get("error", True):
+                    _record_used_item_bounded(used_otps_global, received_otp)
+                    _mark_panel_status_in_session(context, fb_url, True, "Verified working")
+                    success_msg = res_3.get("messageBody") or "Coupon successfully claimed!"
+                    pin_info = _pin_or_increment_working_number(context, phone, fb_url, num_id)
+                    return {
+                        "success": True,
+                        "number": phone,
+                        "endpoint": fb_url,
+                        "otp": received_otp,
+                        "coupon": coupon_code,
+                        "upi_id": upi_id,
+                        "server_message": success_msg,
+                        "failed_logs": failed_logs,
+                        "number_use_count": pin_info["used_count"],
+                        "number_max_uses": pin_info["max_uses"],
+                    }
+                else:
+                    if is_pinned_item:
+                        context.user_data["pinned_firebase_number"] = None
+                    err_3 = str(res_3.get("messageBody") or res_3)
+                    last_error_msg = f"Final UPI Submission Error: {err_3}"
+                    failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_3)[:50]})")
+                    await _notify_progress(f"Number {phone} failed at UPI step, switching...")
+                    continue
+
+            except Exception as e:
                 if is_pinned_item:
                     context.user_data["pinned_firebase_number"] = None
-                reason_short = step1_error_reason if step1_error_reason else f"No OTP after {MAX_SEND_RETRIES} attempts"
-                last_error_msg = f"No OTP received on {phone} after {MAX_SEND_RETRIES} attempts."
-                failed_logs.append(f"❌ {phone} — Failed ({reason_short})")
-                await _notify_progress(f"Number {phone} failed, switching to next...")
+                last_error_msg = str(e)
+                safe_err = _sanitize_plain_log_text(str(e))[:45]
+                failed_logs.append(f"❌ {phone} — Failed ({safe_err})")
+                await _notify_progress(f"Number {phone} encountered an error, switching...")
                 continue
-
-            # STEP 2: OTP Verification
-            await _notify_progress(f"OTP {received_otp} received on {phone} — Verifying OTP...")
-            recaptcha_token_2 = await client.get_dynamic_token(action="submit")
-            payload_step_2 = {
-                "__RequestVerificationToken": dynamic_token,
-                "token": recaptcha_token_2,
-                "curPage": "2",
-                "maxPage": "3",
-                "stateDropdown": state_dropdown_id,
-                "cityDropdown": "0",
-                "branchDropdown": "0",
-                "retailerDropdown": "0",
-                "talukanameDropdown": "0",
-                "parametersOccurance": "0",
-                "CALLPANNAMEMATCH": "0",
-                "MOBILE": phone,
-                "COUPONCODE": coupon_code,
-                "STATE": state_name,
-                "CHECKBOX1": "on",
-                "OTP": received_otp,
-                "REDEMPTIONTYPE": "",
-                "ChoiceAnswer": "",
-            }
-
-            res_2 = await safe_post_json(client, API_ENDPOINT, payload_step_2)
-            if res_2.get("token"):
-                dynamic_token = res_2["token"]
-
-            if res_2.get("error", True):
-                _record_used_item_bounded(used_otps_global, received_otp)
-                if is_pinned_item:
-                    context.user_data["pinned_firebase_number"] = None
-                err_2 = str(res_2.get("messageBody") or res_2)
-                last_error_msg = f"OTP Verification Failed ({phone}): {err_2}"
-                failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_2)[:50]})")
-                await _notify_progress(f"Number {phone} failed OTP check, switching...")
-                continue
-
-            # STEP 3: Final UPI Submission
-            await _notify_progress(f"OTP verified on {phone} — Submitting UPI {upi_id}...")
-            recaptcha_token_3 = await client.get_dynamic_token(action="submit")
-            payload_step_3 = {
-                "__RequestVerificationToken": dynamic_token,
-                "token": recaptcha_token_3,
-                "curPage": "3",
-                "maxPage": "3",
-                "stateDropdown": state_dropdown_id,
-                "cityDropdown": "0",
-                "branchDropdown": "0",
-                "retailerDropdown": "0",
-                "talukanameDropdown": "0",
-                "parametersOccurance": "0",
-                "CALLPANNAMEMATCH": "0",
-                "MOBILE": phone,
-                "COUPONCODE": coupon_code,
-                "STATE": state_name,
-                "CHECKBOX1": "on",
-                "OTP": received_otp,
-                "REDEMPTIONTYPERADIO": "on",
-                "REDEMPTIONTYPE": "10117",
-                "UPIID": upi_id,
-                "CHECKBOX2": "on",
-                "ChoiceAnswer": "10117_on",
-            }
-
-            res_3 = await safe_post_json(client, API_ENDPOINT, payload_step_3)
-            if not res_3.get("error", True):
-                _record_used_item_bounded(used_otps_global, received_otp)
-                _mark_panel_status_in_session(context, fb_url, True, "Verified working")
-                success_msg = res_3.get("messageBody") or "Coupon successfully claimed!"
-                pin_info = _pin_or_increment_working_number(context, phone, fb_url, num_id)
-                return {
-                    "success": True,
-                    "number": phone,
-                    "endpoint": fb_url,
-                    "otp": received_otp,
-                    "coupon": coupon_code,
-                    "upi_id": upi_id,
-                    "server_message": success_msg,
-                    "failed_logs": failed_logs,
-                    "number_use_count": pin_info["used_count"],
-                    "number_max_uses": pin_info["max_uses"],
-                }
-            else:
-                if is_pinned_item:
-                    context.user_data["pinned_firebase_number"] = None
-                err_3 = str(res_3.get("messageBody") or res_3)
-                last_error_msg = f"Final UPI Submission Error: {err_3}"
-                failed_logs.append(f"❌ {phone} — Failed ({_sanitize_plain_log_text(err_3)[:50]})")
-                await _notify_progress(f"Number {phone} failed at UPI step, switching...")
-                continue
-
-        except Exception as e:
-            if is_pinned_item:
-                context.user_data["pinned_firebase_number"] = None
-            last_error_msg = str(e)
-            safe_err = _sanitize_plain_log_text(str(e))[:45]
-            failed_logs.append(f"❌ {phone} — Failed ({safe_err})")
-            await _notify_progress(f"Number {phone} encountered an error, switching...")
-            continue
-        finally:
-            await client.close()
+    finally:
+        await client.close()
 
     return {
         "success": False,
@@ -3839,7 +3893,7 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     )
 
     initial_live_text = _format_live_logs_message(
-        status_line="Scanning active online numbers...",
+        status_line="Session creating...",
         failed_logs=[],
     )
     live_log_msg = await message_target.reply_text(
