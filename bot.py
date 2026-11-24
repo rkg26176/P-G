@@ -23,6 +23,7 @@ from telegram import (
     BotCommand,
 )
 from telegram.constants import ParseMode
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
 MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
-MAX_CONCURRENT_REQUESTS = 30  # Fast concurrent batch limit for checking Firebase URLs
+MAX_CONCURRENT_REQUESTS = 10  # Balanced concurrency limit for checking Firebase URLs
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
@@ -175,14 +176,17 @@ async def _send_safe_long_text(
             return
         except Exception:
             if parse_mode is not None:
-                await message_target.reply_text(
-                    _sanitize_plain_log_text(safe_text)[:3900],
-                    reply_markup=reply_markup,
-                    parse_mode=None,
-                    disable_web_page_preview=disable_web_page_preview,
-                )
+                try:
+                    await message_target.reply_text(
+                        _sanitize_plain_log_text(safe_text)[:3900],
+                        reply_markup=reply_markup,
+                        parse_mode=None,
+                        disable_web_page_preview=disable_web_page_preview,
+                    )
+                except Exception:
+                    pass
                 return
-            raise
+            return
 
     chunks = [safe_text[i:i + 3850] for i in range(0, len(safe_text), 3850)]
     for idx, ch in enumerate(chunks):
@@ -195,12 +199,15 @@ async def _send_safe_long_text(
                 disable_web_page_preview=disable_web_page_preview,
             )
         except Exception:
-            await message_target.reply_text(
-                _sanitize_plain_log_text(ch)[:3850],
-                reply_markup=reply_markup if is_last else None,
-                parse_mode=None,
-                disable_web_page_preview=disable_web_page_preview,
-            )
+            try:
+                await message_target.reply_text(
+                    _sanitize_plain_log_text(ch)[:3850],
+                    reply_markup=reply_markup if is_last else None,
+                    parse_mode=None,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+            except Exception:
+                pass
 
 
 async def get_unjoined_channels(bot, user_id: int) -> list[dict]:
@@ -230,7 +237,11 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    unjoined = await get_unjoined_channels(context.bot, user_id)
+    try:
+        unjoined = await get_unjoined_channels(context.bot, user_id)
+    except Exception:
+        return True
+
     if not unjoined:
         return True
 
@@ -248,7 +259,10 @@ async def ensure_user_subscribed(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
     elif update.message:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception:
+            pass
     return False
 
 
@@ -684,7 +698,7 @@ async def init_user_session(chat_id: int) -> bool:
 
 
 # ==========================================
-# 3. FIREBASE STATUS CHECKER (FAST PARALLEL)
+# 3. FIREBASE STATUS CHECKER (SINGLE CHECK)
 # ==========================================
 def _build_firebase_query_url(firebase_url: str, node_suffix: str = "") -> str:
     """
@@ -794,7 +808,7 @@ def _collect_timestamps_and_activity_recursive(obj, timestamps: list[float], sta
 
 def check_firebase_sms_status(firebase_url: str) -> str:
     """
-    Checks a single Firebase endpoint quickly (4s timeout) to determine
+    Checks a single Firebase endpoint once (no repeated multi-path hits) to determine
     whether it is Active or Inactive.
     """
     target_url = _build_firebase_query_url(firebase_url, "")
@@ -802,7 +816,7 @@ def check_firebase_sms_status(firebase_url: str) -> str:
     state_flags = {"has_online_node": False}
 
     try:
-        response = requests.get(target_url, timeout=4)
+        response = requests.get(target_url, timeout=8)
         response.raise_for_status()
         data = response.json()
 
@@ -2192,7 +2206,7 @@ async def process_text_data_for_bot(
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         tasks = [
-            asyncio.create_task(check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done))
+            check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done)
             for orig_url, fb_url in valid_pairs
         ]
         valid_results = await asyncio.gather(*tasks)
@@ -2501,13 +2515,16 @@ async def send_welcome_portal(message_target, old_count: int = 0) -> None:
         if old_count > 0
         else ""
     )
-    await message_target.reply_text(
-        "👋 **Welcome to the Coupon Automation Portal!**\n"
-        f"{reset_note}\n"
-        "Please choose an option from the menu below to get started:",
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await message_target.reply_text(
+            "👋 **Welcome to the Coupon Automation Portal!**\n"
+            f"{reset_note}\n"
+            "Please choose an option from the menu below to get started:",
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TimedOut:
+        pass
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2765,7 +2782,11 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query or query.message.chat.type != "private":
         return ConversationHandler.END
 
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        pass
+
     user_id = query.from_user.id
 
     unjoined = await get_unjoined_channels(context.bot, user_id)
@@ -2783,14 +2804,21 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
         return ConversationHandler.END
 
-    await query.edit_message_text("✅ **Verification Successful!**", parse_mode="Markdown")
+    try:
+        await query.edit_message_text("✅ **Verification Successful!**", parse_mode="Markdown")
+    except Exception:
+        pass
     await send_welcome_portal(query.message, old_count=0)
     return ConversationHandler.END
 
 
 async def claim_inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        pass
+
     data = query.data
     chat_id = query.message.chat.id
 
@@ -2800,30 +2828,42 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
     context.user_data["telegram_user_info"] = _extract_telegram_user_info(update)
 
     if data == "claim_paste_firebase":
-        await query.edit_message_text(
-            text=PASTE_URL_PROMPT_TEXT,
-            reply_markup=get_cancel_to_claim_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await query.edit_message_text(
+                text=PASTE_URL_PROMPT_TEXT,
+                reply_markup=get_cancel_to_claim_keyboard(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
         return WAITING_FOR_FIREBASE_INPUT
 
     elif data == "claim_send_mobile":
         async with get_user_lock(chat_id):
-            await query.edit_message_text("⏳ Preparing a new session, please wait...")
+            try:
+                await query.edit_message_text("⏳ Preparing a new session, please wait...")
+            except Exception:
+                pass
             token_ok = await init_user_session(chat_id)
 
             if not token_ok:
-                await query.edit_message_text(
-                    "⚠️ Unable to fetch initial session token from the website. "
-                    "Please check your connection and try again.",
-                    reply_markup=get_cancel_to_claim_keyboard(),
-                )
+                try:
+                    await query.edit_message_text(
+                        "⚠️ Unable to fetch initial session token from the website. "
+                        "Please check your connection and try again.",
+                        reply_markup=get_cancel_to_claim_keyboard(),
+                    )
+                except Exception:
+                    pass
                 return ConversationHandler.END
 
-            await query.edit_message_text(
-                "🚀 New session initialized.\nPlease enter your 10-digit mobile number:",
-                reply_markup=get_cancel_to_claim_keyboard(),
-            )
+            try:
+                await query.edit_message_text(
+                    "🚀 New session initialized.\nPlease enter your 10-digit mobile number:",
+                    reply_markup=get_cancel_to_claim_keyboard(),
+                )
+            except Exception:
+                pass
             return WAITING_FOR_DIRECT_MOBILE_FLOW
 
     elif data == "fb_keep_existing_upi":
@@ -2870,20 +2910,26 @@ async def claim_inline_callback_handler(update: Update, context: ContextTypes.DE
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            await query.message.reply_text(
-                text=CLAIM_PANEL_TEXT,
-                reply_markup=get_claim_coupon_inline_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            try:
+                await query.message.reply_text(
+                    text=CLAIM_PANEL_TEXT,
+                    reply_markup=get_claim_coupon_inline_keyboard(),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
         return ConversationHandler.END
 
     elif data == "claim_cancel_main":
         await cancel_running_claim_task(chat_id)
         await close_user_session(chat_id)
-        await query.edit_message_text(
-            text="❌ **Action Cancelled.** Please select an option from the main menu below.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await query.edit_message_text(
+                text="❌ **Action Cancelled.** Please select an option from the main menu below.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
         return ConversationHandler.END
 
     return ConversationHandler.END
@@ -3174,12 +3220,17 @@ async def _run_firebase_scan_with_live_logs(
 
     checked_lines: list[str] = []
     last_live_text = live_scan_msg.text or ""
+    last_edit_time = 0.0
 
     async def _on_link_checked(done_count: int, total_count: int, item_res: dict):
-        nonlocal last_live_text
+        nonlocal last_live_text, last_edit_time
         ep_short = _sanitize_plain_log_text(item_res.get("firebase_endpoint", ""))
         st_short = _sanitize_plain_log_text(item_res.get("status", ""))
         checked_lines.append(f"[{done_count}/{total_count}] {ep_short} -> {st_short}")
+
+        now_ts = time.monotonic()
+        if done_count < total_count and (done_count % 5 != 0) and (now_ts - last_edit_time < 1.5):
+            return
 
         live_body = (
             f"🔄 Databases checked: {done_count}/{total_count} | Running...\n"
@@ -3189,6 +3240,7 @@ async def _run_firebase_scan_with_live_logs(
             live_body = live_body[:3790] + "\n..."
         if live_body != last_live_text:
             last_live_text = live_body
+            last_edit_time = now_ts
             try:
                 await live_scan_msg.edit_text(
                     live_body,
