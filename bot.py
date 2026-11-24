@@ -1373,7 +1373,6 @@ def _rank_candidates_by_recent_otp(candidates: list[dict], root_data: Any) -> li
                         if (now_sec - sub_ts) <= RECENT_OTP_WINDOW_SEC:
                             if best_ts is None or sub_ts > best_ts:
                                 best_ts = sub_ts
-                    # Check matching number sub-records specifically
                     stack = [sec_val]
                     while stack:
                         cur = stack.pop()
@@ -2956,7 +2955,7 @@ def build_atoz_claim_log_text(
 
 def _has_preserved_coupons(context: ContextTypes.DEFAULT_TYPE) -> bool:
     all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
-    used_coupons: list[str] = context.user_data.get("used_firebase_coupons", [])
+    used_coupons: list[str] = context.user_data.setdefault("used_firebase_coupons", [])
     return any(c not in used_coupons for c in all_coupons)
 
 
