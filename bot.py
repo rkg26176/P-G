@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
 MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
-MAX_CONCURRENT_REQUESTS = 10  # Concurrency limit for checking Firebase URLs
+MAX_CONCURRENT_REQUESTS = 30  # Fast concurrent batch limit for checking Firebase URLs
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
@@ -684,7 +684,7 @@ async def init_user_session(chat_id: int) -> bool:
 
 
 # ==========================================
-# 3. FIREBASE STATUS CHECKER (SINGLE CHECK)
+# 3. FIREBASE STATUS CHECKER (FAST PARALLEL)
 # ==========================================
 def _build_firebase_query_url(firebase_url: str, node_suffix: str = "") -> str:
     """
@@ -794,7 +794,7 @@ def _collect_timestamps_and_activity_recursive(obj, timestamps: list[float], sta
 
 def check_firebase_sms_status(firebase_url: str) -> str:
     """
-    Checks a single Firebase endpoint once (no repeated multi-path hits) to determine
+    Checks a single Firebase endpoint quickly (4s timeout) to determine
     whether it is Active or Inactive.
     """
     target_url = _build_firebase_query_url(firebase_url, "")
@@ -802,7 +802,7 @@ def check_firebase_sms_status(firebase_url: str) -> str:
     state_flags = {"has_online_node": False}
 
     try:
-        response = requests.get(target_url, timeout=15)
+        response = requests.get(target_url, timeout=4)
         response.raise_for_status()
         data = response.json()
 
@@ -1552,13 +1552,11 @@ async def auto_claim_triplet_on_woohoo(
         if pinned_num and pinned_num["endpoint"] == fb_url:
             seen_in_panel.add(pinned_num["number"])
 
-        # First queue fresh numbers not yet in used_numbers
         for c in candidates:
             if c["number"] not in used_numbers and c["number"] not in seen_in_panel:
                 seen_in_panel.add(c["number"])
                 ordered_queue.append((fb_url, c))
 
-        # Also queue any other numbers from this panel not yet in ordered_queue for this panel
         for c in candidates:
             if c["number"] not in seen_in_panel:
                 seen_in_panel.add(c["number"])
@@ -2194,7 +2192,7 @@ async def process_text_data_for_bot(
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         tasks = [
-            check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done)
+            asyncio.create_task(check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done))
             for orig_url, fb_url in valid_pairs
         ]
         valid_results = await asyncio.gather(*tasks)
