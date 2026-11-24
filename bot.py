@@ -924,7 +924,7 @@ async def is_firebase_active(fb_url: str, timeout: int = 12) -> Dict[str, Any]:
                 if online_count > 0:
                     return {"active": True, "reason": "online_sources_found", "online_count": online_count}
 
-                return {"active": True, "reason": "live_database_accessible", "online_count": 0}
+                return {"active": False, "reason": "no_online_sources", "online_count": 0}
 
     except Exception as exc:
         return {"active": False, "reason": f"error:{str(exc)[:80]}", "online_count": 0}
@@ -1216,9 +1216,16 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
 
 
 def _get_firebase_root_and_query(firebase_url: str) -> tuple[str, str]:
-    """Splits a Firebase URL into its clean root domain URL and optional query string (e.g., auth=...)."""
+    """Splits a Firebase URL into its clean root URL (preserving any path) and query string."""
     parsed = urlparse(firebase_url.strip())
-    root = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    path = parsed.path or ""
+    if path.endswith("/.json"):
+        path = path[:-6]
+    elif path.endswith("/json"):
+        path = path[:-5]
+    elif path.endswith(".json"):
+        path = path[:-5]
+    root = parsed._replace(path=path.rstrip("/"), query="").geturl()
     return root, parsed.query
 
 
@@ -2123,7 +2130,7 @@ def read_text_from_zip(zip_path: str) -> str:
 
 def read_text_from_txt(txt_path: str) -> str:
     """Reads text content from a .txt file."""
-    with open(txt_path, "r", encoding="utf-8", errors='ignore') as f:
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 
