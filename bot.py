@@ -1056,6 +1056,8 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
             key_lower = str(key).lower()
             if "offline" in key_lower:
                 continue
+            if key_lower in ("sms", "messages", "inbox", "user_sms", "all_user", "all_users"):
+                continue
 
             branch_online = node_online or ("online" in key_lower)
 
@@ -1074,7 +1076,7 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
                 for n in sub_nums:
                     if n not in results:
                         results.append(n)
-            elif branch_online and val is not None:
+            elif branch_online and val is not None and isinstance(val, dict):
                 val_nums = re.findall(number_pattern, str(val))
                 for n in val_nums:
                     if n not in results:
@@ -1546,12 +1548,21 @@ async def auto_claim_triplet_on_woohoo(
         if not candidates:
             continue
 
-        fresh_candidates = [c for c in candidates if c["number"] not in used_numbers]
-        pool = fresh_candidates if fresh_candidates else candidates
-        for c in pool:
-            if pinned_num and c["number"] == pinned_num["number"]:
-                continue
-            ordered_queue.append((fb_url, c))
+        seen_in_panel: set[str] = set()
+        if pinned_num and pinned_num["endpoint"] == fb_url:
+            seen_in_panel.add(pinned_num["number"])
+
+        # First queue fresh numbers not yet in used_numbers
+        for c in candidates:
+            if c["number"] not in used_numbers and c["number"] not in seen_in_panel:
+                seen_in_panel.add(c["number"])
+                ordered_queue.append((fb_url, c))
+
+        # Also queue any other numbers from this panel not yet in ordered_queue for this panel
+        for c in candidates:
+            if c["number"] not in seen_in_panel:
+                seen_in_panel.add(c["number"])
+                ordered_queue.append((fb_url, c))
 
     if not ordered_queue:
         return {"success": False, "reason": "ALL_NUMBERS_EXHAUSTED", "message": last_error_msg, "failed_logs": failed_logs}
