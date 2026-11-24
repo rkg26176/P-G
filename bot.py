@@ -2699,6 +2699,10 @@ async def process_text_data_for_bot(
     has_saved_panels = False
 
     if valid_pairs:
+        if context.user_data.pop("reset_panels_on_next_input", False):
+            context.user_data["session_panels"] = {}
+            context.user_data["pinned_firebase_number"] = None
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         saved_items = [
             {
@@ -2955,7 +2959,7 @@ def build_atoz_claim_log_text(
 
 def _has_preserved_coupons(context: ContextTypes.DEFAULT_TYPE) -> bool:
     all_coupons: list[str] = context.user_data.get("firebase_coupons", [])
-    used_coupons: list[str] = context.user_data.setdefault("used_firebase_coupons", [])
+    used_coupons: list[str] = context.user_data.get("used_firebase_coupons", [])
     return any(c not in used_coupons for c in all_coupons)
 
 
@@ -4084,6 +4088,9 @@ async def send_firebase_assigned_triplet(message_target, context: ContextTypes.D
     if not claim_result.get("success"):
         if claim_result.get("reason") != "COUPON_INVALID":
             release_unredeemed_firebase_coupon(context, locked_coupon)
+            context.user_data["session_panels"] = {}
+            context.user_data["pinned_firebase_number"] = None
+            context.user_data["reset_panels_on_next_input"] = True
             await _send_active_panels_txt_file(message_target, context)
             await _send_safe_long_text(
                 message_target,
@@ -4268,6 +4275,7 @@ def main():
         entry_points=[
             CommandHandler("claim", claim_command),
             CommandHandler("pnlclaim", pnlclaim_command),
+            MessageHandler(filters.Regex("^Check Coupon$"), handle_check_coupon_menu),
             CallbackQueryHandler(
                 claim_inline_callback_handler,
                 pattern="^(claim_paste_firebase|claim_send_mobile|back_to_claim_menu|claim_cancel_main)$",
@@ -4329,7 +4337,6 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
     app.add_handler(MessageHandler(filters.Regex("^Claim Coupon$"), handle_claim_coupon_menu))
-    app.add_handler(MessageHandler(filters.Regex("^Check Coupon$"), handle_check_coupon_menu))
     app.add_handler(
         MessageHandler(
             filters.Regex("^(Buy Coupon|Support|🏆 Leaderboard)$"),
