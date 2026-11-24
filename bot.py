@@ -10,9 +10,10 @@ import time
 import zipfile
 from collections import defaultdict
 from datetime import datetime
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse, parse_qs, unquote
 
+import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
@@ -55,11 +56,10 @@ MAX_FIREBASE_NUMBER_USES = 8  # Fixed usage limit per verified working Firebase 
 MAX_SEND_RETRIES = 2  # Maximum OTP send attempts per online mobile number
 WAIT_SECONDS = 10  # Wait duration in seconds per OTP check cycle
 SMS_WAIT_TIMEOUT = float(WAIT_SECONDS)
+ONLINE_MAX_AGE_SEC = 1800
 
 OTP_KEYWORDS = ["VM-QWKCLR-S", "otp", "code", "verification", "login"]
 OTP_PATTERNS = [
-    re.compile(r"Use OTP (\d{6}) to log into your Swiggy account", re.IGNORECASE),
-    re.compile(r"(\d{6})\s+is your Swiggy", re.IGNORECASE),
     re.compile(r"VM-QWKCLR-S.*?OTP.*?(\d{6})", re.IGNORECASE),
     re.compile(r"login code[:\s]*(\d{6})", re.IGNORECASE),
     re.compile(r"verification code[:\s]*(\d{6})", re.IGNORECASE),
@@ -782,6 +782,154 @@ def _parse_any_timestamp_to_seconds(ts_val) -> Optional[float]:
     return None
 
 
+def _check_node_online_activity(info: Dict[str, Any]) -> Optional[bool]:
+    """Checks online state using recent timestamps or status/online/active flags."""
+    if not isinstance(info, dict):
+        return None
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - ONLINE_MAX_AGE_SEC * 1000
+
+    ts_keys = (
+        "lastSeen", "last_seen", "lastSeenAt", "lastActive", "last_active",
+        "lastOnline", "last_online", "updatedAt", "updated_at",
+        "lastPing", "last_ping", "lastupdate", "timestamp",
+    )
+    for key in ts_keys:
+        if key in info:
+            ts_sec = _parse_any_timestamp_to_seconds(info[key])
+            if ts_sec is not None and ts_sec > 0:
+                return (int(ts_sec * 1000)) >= cutoff_ms
+
+    for key in ("status", "Status", "online", "Online", "is_online", "isOnline", "active", "isActive"):
+        if key in info:
+            val = info[key]
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                return bool(val)
+            if isinstance(val, str):
+                low = val.strip().lower()
+                if low in ("true", "online", "1", "yes", "active"):
+                    return True
+                if low in ("false", "offline", "0", "no", "inactive"):
+                    return False
+
+    for nest in ("Info", "info", "deviceInfo", "DeviceInfo", "meta", "Meta", "device"):
+        sub = info.get(nest)
+        if isinstance(sub, dict):
+            res = _check_node_online_activity(sub)
+            if res is not None:
+                return res
+
+    return None
+
+
+def _is_firebase_node_offline(node: dict) -> bool:
+    """Checks whether a Firebase device/session node is marked offline."""
+    status_val = str(
+        node.get("status")
+        or node.get("state")
+        or node.get("connection")
+        or node.get("network")
+        or node.get("mode")
+        or ""
+    ).strip().lower()
+
+    if "offline" in status_val:
+        return True
+
+    for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
+        if flag_key in node:
+            val = node[flag_key]
+            if val is False or str(val).strip().lower() in ("false", "0", "no", "offline"):
+                return True
+
+    if "offline" in node and node["offline"] is True:
+        return True
+
+    return False
+
+
+def _is_firebase_node_online(node: dict) -> bool:
+    """Checks whether a Firebase device/session node is explicitly online or recently active."""
+    if _is_firebase_node_offline(node):
+        return False
+
+    status_val = str(
+        node.get("status")
+        or node.get("state")
+        or node.get("connection")
+        or node.get("network")
+        or node.get("mode")
+        or ""
+    ).strip().lower()
+
+    if "online" in status_val:
+        return True
+
+    for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
+        if flag_key in node:
+            val = node[flag_key]
+            if val is True or str(val).strip().lower() in ("true", "1", "yes", "online"):
+                return True
+
+    for ts_key in ("lastSeen", "last_seen", "ping", "heartbeat", "updatedAt", "timestamp"):
+        ts = node.get(ts_key)
+        if ts is not None:
+            parsed_sec = _parse_any_timestamp_to_seconds(ts)
+            if parsed_sec is not None and 0 <= (time.time() - parsed_sec) <= ONLINE_MAX_AGE_SEC:
+                return True
+
+    return False
+
+
+async def is_firebase_active(fb_url: str, timeout: int = 12) -> Dict[str, Any]:
+    """
+    Checks whether a Firebase database is accessible and contains any active/online source.
+    """
+    root_url, query = _get_firebase_root_and_query(fb_url)
+    check_url = f"{root_url}/.json" + (f"?{query}" if query else "")
+
+    try:
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            async with session.get(check_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                if resp.status == 401:
+                    return {"active": False, "reason": "permission_denied", "online_count": 0}
+                if resp.status != 200:
+                    return {"active": False, "reason": f"http_{resp.status}", "online_count": 0}
+
+                data = await resp.json(content_type=None)
+                if not data:
+                    return {"active": False, "reason": "empty_database", "online_count": 0}
+
+                online_count = 0
+                if isinstance(data, dict):
+                    clients_node = data.get("clients")
+                    if isinstance(clients_node, dict):
+                        for _, info in clients_node.items():
+                            if isinstance(info, dict):
+                                state = _check_node_online_activity(info)
+                                if state is True or state is None:
+                                    online_count += 1
+
+                    numbers_node = data.get("numbers")
+                    if isinstance(numbers_node, dict):
+                        for _, info in numbers_node.items():
+                            if isinstance(info, dict):
+                                state = _check_node_online_activity(info)
+                                if state is True or state is None:
+                                    online_count += 1
+
+                if online_count > 0:
+                    return {"active": True, "reason": "online_sources_found", "online_count": online_count}
+
+                return {"active": True, "reason": "live_database_accessible", "online_count": 0}
+
+    except Exception as exc:
+        return {"active": False, "reason": f"error:{str(exc)[:80]}", "online_count": 0}
+
+
 def _collect_timestamps_and_activity_recursive(obj, timestamps: list[float], state_flags: dict) -> None:
     """
     Recursively traverses the entire Firebase JSON tree (including nested sms/messages/devices nodes)
@@ -832,7 +980,7 @@ def check_firebase_sms_status(firebase_url: str) -> str:
     sess = _get_fb_http_session()
 
     try:
-        response = sess.get(target_url, timeout=(3.0, 4.0))
+        response = sess.get(target_url, timeout=(8.0, 15.0))
         response.raise_for_status()
         data = response.json()
 
@@ -1008,65 +1156,6 @@ def is_valid_upi_format(upi_id: str) -> bool:
     return bool(re.match(upi_pattern, upi_id))
 
 
-def _is_firebase_node_offline(node: dict) -> bool:
-    """Checks whether a Firebase device/session node is marked offline."""
-    status_val = str(
-        node.get("status")
-        or node.get("state")
-        or node.get("connection")
-        or node.get("network")
-        or node.get("mode")
-        or ""
-    ).strip().lower()
-
-    if "offline" in status_val:
-        return True
-
-    for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
-        if flag_key in node:
-            val = node[flag_key]
-            if val is False or str(val).strip().lower() in ("false", "0", "no", "offline"):
-                return True
-
-    if "offline" in node and node["offline"] is True:
-        return True
-
-    return False
-
-
-def _is_firebase_node_online(node: dict) -> bool:
-    """Checks whether a Firebase device/session node is explicitly online or recently active."""
-    if _is_firebase_node_offline(node):
-        return False
-
-    status_val = str(
-        node.get("status")
-        or node.get("state")
-        or node.get("connection")
-        or node.get("network")
-        or node.get("mode")
-        or ""
-    ).strip().lower()
-
-    if "online" in status_val:
-        return True
-
-    for flag_key in ("online", "isOnline", "is_online", "active", "isActive"):
-        if flag_key in node:
-            val = node[flag_key]
-            if val is True or str(val).strip().lower() in ("true", "1", "yes", "online"):
-                return True
-
-    for ts_key in ("lastSeen", "last_seen", "ping", "heartbeat", "updatedAt", "timestamp"):
-        ts = node.get(ts_key)
-        if ts is not None:
-            parsed_sec = _parse_any_timestamp_to_seconds(ts)
-            if parsed_sec is not None and 0 <= (time.time() - parsed_sec) <= 600:
-                return True
-
-    return False
-
-
 def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inherited_online: bool = False) -> list[str]:
     """
     Scans a Firebase JSON tree:
@@ -1127,37 +1216,57 @@ def _extract_online_numbers_from_tree(obj, inherited_offline: bool = False, inhe
 
 
 def _get_firebase_root_and_query(firebase_url: str) -> tuple[str, str]:
-    """Splits a Firebase URL into its clean root URL and optional query string (e.g., auth=...)."""
+    """Splits a Firebase URL into its clean root domain URL and optional query string (e.g., auth=...)."""
     parsed = urlparse(firebase_url.strip())
-    path = parsed.path or ""
-    if path.endswith("/.json"):
-        path = path[:-6]
-    elif path.endswith("/json"):
-        path = path[:-5]
-    elif path.endswith(".json"):
-        path = path[:-5]
-    root = parsed._replace(path=path.rstrip("/"), query="").geturl()
+    root = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
     return root, parsed.query
 
 
-def get_online_numbers(firebase_url: str) -> list[dict]:
-    """Fetches numbers with 'online' status from Firebase /numbers.json."""
-    root_url, query = _get_firebase_root_and_query(firebase_url)
-    target = f"{root_url}/numbers.json" + (f"?{query}" if query else "")
-    try:
-        res = requests.get(target, timeout=10)
-        if res.status_code == 200 and res.json():
-            data = res.json()
-            online_list = []
+def _clean_ten_digit_indian_number(val: Any) -> Optional[str]:
+    digits = re.sub(r"\D", "", str(val or ""))
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10 and digits[0] in "6789":
+        return digits
+    return None
 
-            if isinstance(data, dict):
-                for key, info in data.items():
-                    if isinstance(info, dict) and str(info.get("status", "")).lower() == "online":
-                        num = info.get("number") or info.get("phone") or key
-                        online_list.append({"id": key, "number": str(num)})
-            return online_list
-    except Exception as e:
-        print(f"  [Error] Failed to fetch online numbers from Firebase ({root_url}): {e}")
+
+def get_online_numbers(firebase_url: str) -> list[dict]:
+    """Fetches numbers with 'online' status from Firebase /numbers.json or /clients.json."""
+    root_url, query = _get_firebase_root_and_query(firebase_url)
+    q_suffix = f"?{query}" if query else ""
+
+    for node in ("numbers.json", "clients.json"):
+        target = f"{root_url}/{node}{q_suffix}"
+        try:
+            res = requests.get(target, timeout=10)
+            if res.status_code == 200 and res.json():
+                data = res.json()
+                online_list = []
+
+                if isinstance(data, dict):
+                    for key, info in data.items():
+                        if not isinstance(info, dict):
+                            continue
+                        status_str = str(info.get("status", "")).lower()
+                        is_on = (status_str == "online") or _is_firebase_node_online(info)
+                        if is_on:
+                            raw_num = (
+                                info.get("number")
+                                or info.get("phone")
+                                or info.get("mobNo")
+                                or info.get("mobile")
+                                or key
+                            )
+                            cleaned = _clean_ten_digit_indian_number(raw_num)
+                            if cleaned:
+                                online_list.append({"id": key, "number": cleaned})
+                if online_list:
+                    return online_list
+        except Exception as e:
+            print(f"  [Error] Failed to fetch online numbers from Firebase ({target}): {e}")
     return []
 
 
@@ -1286,7 +1395,7 @@ def _fetch_numbers_from_single_firebase_sync(firebase_url: str) -> list[str]:
 async def fetch_random_active_number_from_panels(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
     """
     Fetches an active online number from saved Active Firebase Panels
-    (via /numbers.json first, falling back to single-URL tree scanning).
+    (via /numbers.json or /clients.json first, falling back to single-URL tree scanning).
     """
     session_panels: dict = context.user_data.get("session_panels", {})
     active_endpoints = [
@@ -1542,6 +1651,15 @@ async def auto_claim_triplet_on_woohoo(
     ]
     if not active_endpoints:
         return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No active Firebase panels found.", "failed_logs": []}
+
+    verified_endpoints: list[str] = []
+    for ep in active_endpoints:
+        fb_check = await is_firebase_active(ep)
+        if fb_check.get("active"):
+            verified_endpoints.append(ep)
+    if not verified_endpoints:
+        return {"success": False, "reason": "NO_ACTIVE_PANELS", "message": "No accessible/active Firebase databases found.", "failed_logs": []}
+    active_endpoints = verified_endpoints
 
     used_numbers: list[str] = context.user_data.setdefault("used_firebase_numbers", [])
     used_otps_global: list[str] = context.user_data.setdefault("used_firebase_otps", [])
@@ -2005,7 +2123,7 @@ def read_text_from_zip(zip_path: str) -> str:
 
 def read_text_from_txt(txt_path: str) -> str:
     """Reads text content from a .txt file."""
-    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(txt_path, "r", encoding="utf-8", errors='ignore') as f:
         return f.read()
 
 
