@@ -130,6 +130,12 @@ DEVICE_PROFILES = [
 SESSION_TIMEOUT_SECONDS = 600  # 10 minutes inactivity timeout
 
 
+def generate_random_coupon_code(length: int = 12) -> str:
+    """Generates a random uppercase alphanumeric coupon code like '6W7CQ3M8M3AV'."""
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.choices(alphabet, k=length))
+
+
 # ==========================================
 # 2. GLOBAL BROWSER & UNIFIED SESSION CLIENT
 # ==========================================
@@ -3555,7 +3561,7 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                 )
                 return ConversationHandler.END
 
-        # STEP 3: OTP Verification
+        # STEP 3: OTP Verification (Page 2: try random 12-char coupon first; fallback to original coupon on error)
         elif current_step == "AWAITING_OTP":
             if not text.isdigit():
                 await update.message.reply_text(
@@ -3567,9 +3573,11 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             session_data["otp"] = text
             await update.message.reply_text("⏳ Verifying OTP, please wait...")
 
-            recaptcha_token = await client.get_dynamic_token(action="submit")
+            original_coupon = session_data["code"]
+            random_coupon_page2 = generate_random_coupon_code(12)
 
-            payload_step_2 = {
+            recaptcha_token = await client.get_dynamic_token(action="submit")
+            payload_step_2_random = {
                 "__RequestVerificationToken": session_data["dynamic_token"],
                 "token": recaptcha_token,
                 "curPage": "2",
@@ -3582,7 +3590,7 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                 "parametersOccurance": "0",
                 "CALLPANNAMEMATCH": "0",
                 "MOBILE": session_data["mobile"],
-                "COUPONCODE": session_data["code"],
+                "COUPONCODE": random_coupon_page2,
                 "STATE": session_data["state"],
                 "CHECKBOX1": "on",
                 "OTP": session_data["otp"],
@@ -3591,10 +3599,37 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             }
 
             try:
-                res_2_json = await safe_post_json(client, API_ENDPOINT, payload_step_2)
+                res_2_json = await safe_post_json(client, API_ENDPOINT, payload_step_2_random)
 
                 if res_2_json.get("token"):
                     session_data["dynamic_token"] = res_2_json["token"]
+
+                if res_2_json.get("error", True):
+                    # Fallback to original active coupon on Page 2 error
+                    recaptcha_token_retry = await client.get_dynamic_token(action="submit")
+                    payload_step_2_orig = {
+                        "__RequestVerificationToken": session_data["dynamic_token"],
+                        "token": recaptcha_token_retry,
+                        "curPage": "2",
+                        "maxPage": "3",
+                        "stateDropdown": session_data["state_dropdown"],
+                        "cityDropdown": "0",
+                        "branchDropdown": "0",
+                        "retailerDropdown": "0",
+                        "talukanameDropdown": "0",
+                        "parametersOccurance": "0",
+                        "CALLPANNAMEMATCH": "0",
+                        "MOBILE": session_data["mobile"],
+                        "COUPONCODE": original_coupon,
+                        "STATE": session_data["state"],
+                        "CHECKBOX1": "on",
+                        "OTP": session_data["otp"],
+                        "REDEMPTIONTYPE": "",
+                        "ChoiceAnswer": "",
+                    }
+                    res_2_json = await safe_post_json(client, API_ENDPOINT, payload_step_2_orig)
+                    if res_2_json.get("token"):
+                        session_data["dynamic_token"] = res_2_json["token"]
 
                 if res_2_json.get("error", True):
                     error_msg = res_2_json.get("messageBody") or str(res_2_json)
@@ -3618,7 +3653,7 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                 )
                 return ConversationHandler.END
 
-        # STEP 4: UPI ID Input & Final Submission
+        # STEP 4: UPI ID Input & Final Submission (Page 3: try random 12-char coupon first; fallback to original coupon)
         elif current_step == "AWAITING_UPI":
             if "@" not in text or len(text) < 5:
                 await update.message.reply_text(
@@ -3630,9 +3665,11 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             session_data["upi_id"] = text
             await update.message.reply_text("⏳ Submitting final details, please wait...")
 
-            recaptcha_token = await client.get_dynamic_token(action="submit")
+            original_coupon = session_data["code"]
+            random_coupon_page3 = generate_random_coupon_code(12)
 
-            payload_step_3 = {
+            recaptcha_token = await client.get_dynamic_token(action="submit")
+            payload_step_3_random = {
                 "__RequestVerificationToken": session_data["dynamic_token"],
                 "token": recaptcha_token,
                 "curPage": "3",
@@ -3645,7 +3682,7 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
                 "parametersOccurance": "0",
                 "CALLPANNAMEMATCH": "0",
                 "MOBILE": session_data["mobile"],
-                "COUPONCODE": session_data["code"],
+                "COUPONCODE": random_coupon_page3,
                 "STATE": session_data["state"],
                 "CHECKBOX1": "on",
                 "OTP": session_data["otp"],
@@ -3657,10 +3694,40 @@ async def receive_direct_mobile_flow_input(update: Update, context: ContextTypes
             }
 
             try:
-                res_3_json = await safe_post_json(client, API_ENDPOINT, payload_step_3)
+                res_3_json = await safe_post_json(client, API_ENDPOINT, payload_step_3_random)
 
                 if res_3_json.get("token"):
                     session_data["dynamic_token"] = res_3_json["token"]
+
+                if res_3_json.get("error", True):
+                    # Try once with the original coupon on Page 3; if that also fails, surface the original error
+                    recaptcha_token_retry = await client.get_dynamic_token(action="submit")
+                    payload_step_3_orig = {
+                        "__RequestVerificationToken": session_data["dynamic_token"],
+                        "token": recaptcha_token_retry,
+                        "curPage": "3",
+                        "maxPage": "3",
+                        "stateDropdown": session_data["state_dropdown"],
+                        "cityDropdown": "0",
+                        "branchDropdown": "0",
+                        "retailerDropdown": "0",
+                        "talukanameDropdown": "0",
+                        "parametersOccurance": "0",
+                        "CALLPANNAMEMATCH": "0",
+                        "MOBILE": session_data["mobile"],
+                        "COUPONCODE": original_coupon,
+                        "STATE": session_data["state"],
+                        "CHECKBOX1": "on",
+                        "OTP": session_data["otp"],
+                        "REDEMPTIONTYPERADIO": "on",
+                        "REDEMPTIONTYPE": "10117",
+                        "UPIID": session_data["upi_id"],
+                        "CHECKBOX2": "on",
+                        "ChoiceAnswer": "10117_on",
+                    }
+                    res_3_json = await safe_post_json(client, API_ENDPOINT, payload_step_3_orig)
+                    if res_3_json.get("token"):
+                        session_data["dynamic_token"] = res_3_json["token"]
 
                 if not res_3_json.get("error", True):
                     success_msg = res_3_json.get("messageBody") or "Process completed successfully!"
